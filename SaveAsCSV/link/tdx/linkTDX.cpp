@@ -15,13 +15,14 @@
  * Func2: date/time arrays
  *   pIn1[] = date (YYYYMMDD - 19000000)
  *   pIn2[] = time (HHMM, 0000-2359)
+ *   pIn3[] = iso_week (1-53, optional, mainly for weekly export)
  *
  * Func3: price/amount data by type
  *   pIn1[0] = type (1=open, 2=close, 3=high, 4=low, 5=volume, 6=amount)
  *   pIn2[]  = data array
  *
  * Period code mapping used:
- *   0=1m, 1=5m, 3=30m, 5=1d, 6=1w, 7=1mo, 11=1y
+ *   0=1m, 1=5m, 3=30m, 5=1d, 6=1w, 7=1mo, 10=1q, 11=1y
  */
 #include "linkTDX.h"
 
@@ -50,6 +51,7 @@ struct ExportState
     bool has_period = false;
     bool has_date = false;
     bool has_time = false;
+    bool has_week = false;
     bool has_open = false;
     bool has_high = false;
     bool has_low = false;
@@ -64,6 +66,7 @@ struct ExportState
 
     std::vector<float> date;
     std::vector<float> time;
+    std::vector<float> week;
     std::vector<float> open;
     std::vector<float> high;
     std::vector<float> low;
@@ -86,6 +89,10 @@ struct CsvRow
     std::string symbol;
     std::string period;
     std::string ts;
+    std::string month_key;
+    std::string week_key;
+    std::string quarter_key;
+    std::string year_key;
     float open = 0.0f;
     float high = 0.0f;
     float low = 0.0f;
@@ -157,6 +164,8 @@ std::string period_code_to_str(int code)
         return "1w";
     case 7:
         return "1mo";
+    case 10:
+        return "1q";
     case 11:
         return "1y";
     default:
@@ -254,6 +263,243 @@ std::string date_dir_name(int date)
     return oss.str();
 }
 
+bool period_is_week(const std::string &period)
+{
+    return period == "1w";
+}
+
+bool period_is_month(const std::string &period)
+{
+    return period == "1mo";
+}
+
+bool period_is_quarter(const std::string &period)
+{
+    return period == "1q";
+}
+
+bool period_is_year(const std::string &period)
+{
+    return period == "1y";
+}
+
+bool is_leap_year(int year)
+{
+    return (year % 400 == 0) || ((year % 4 == 0) && (year % 100 != 0));
+}
+
+int day_of_year(int year, int month, int day)
+{
+    static const int kMonthDays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month < 1 || month > 12 || day < 1)
+        return 0;
+
+    int max_day = kMonthDays[month - 1] + ((month == 2 && is_leap_year(year)) ? 1 : 0);
+    if (day > max_day)
+        return 0;
+
+    int doy = day;
+    for (int m = 1; m < month; ++m)
+    {
+        doy += kMonthDays[m - 1];
+        if (m == 2 && is_leap_year(year))
+            ++doy;
+    }
+    return doy;
+}
+
+// Returns Monday=1 ... Sunday=7
+int weekday_monday_1to7(int year, int month, int day)
+{
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    int y = year;
+    if (month < 3)
+        --y;
+    int w = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7; // Sunday=0
+    return (w == 0) ? 7 : w;
+}
+
+int iso_weeks_in_year(int year)
+{
+    int jan1_wday = weekday_monday_1to7(year, 1, 1);
+    if (jan1_wday == 4 || (jan1_wday == 3 && is_leap_year(year)))
+        return 53;
+    return 52;
+}
+
+int calc_iso_week_num(int year, int month, int day)
+{
+    int doy = day_of_year(year, month, day);
+    if (doy <= 0)
+        return 1;
+
+    int wday = weekday_monday_1to7(year, month, day);
+    int week = (doy - wday + 10) / 7;
+    if (week < 1)
+        return iso_weeks_in_year(year - 1);
+
+    int max_week = iso_weeks_in_year(year);
+    if (week > max_week)
+        return 1;
+    return week;
+}
+
+int calc_iso_week_num_from_date(int yyyymmdd)
+{
+    int year = 0, month = 0, day = 0;
+    split_date(yyyymmdd, year, month, day);
+    return calc_iso_week_num(year, month, day);
+}
+
+std::string format_month_key(int yyyymmdd)
+{
+    int year = 0, month = 0, day = 0;
+    split_date(yyyymmdd, year, month, day);
+    (void)day;
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << std::setw(2) << month;
+    return oss.str();
+}
+
+std::string format_quarter_key(int yyyymmdd)
+{
+    int year = 0, month = 0, day = 0;
+    split_date(yyyymmdd, year, month, day);
+    (void)day;
+
+    int quarter = (month - 1) / 3 + 1;
+    if (quarter < 1)
+        quarter = 1;
+    if (quarter > 4)
+        quarter = 4;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << 'Q' << quarter;
+    return oss.str();
+}
+
+std::string format_year_key(int yyyymmdd)
+{
+    int year = 0, month = 0, day = 0;
+    split_date(yyyymmdd, year, month, day);
+    (void)month;
+    (void)day;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year;
+    return oss.str();
+}
+
+std::string format_week_key(int year, int week_num)
+{
+    if (week_num < 1 || week_num > 53)
+        week_num = 1;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << 'W' << std::setw(2) << week_num;
+    return oss.str();
+}
+
+bool parse_date_from_ts(const std::string &ts, int &year, int &month, int &day)
+{
+    if (ts.size() < 10 || ts[4] != '-' || ts[7] != '-')
+        return false;
+
+    year = std::atoi(ts.substr(0, 4).c_str());
+    month = std::atoi(ts.substr(5, 2).c_str());
+    day = std::atoi(ts.substr(8, 2).c_str());
+    return (year > 0 && month >= 1 && month <= 12 && day >= 1 && day <= 31);
+}
+
+std::string month_key_from_ts(const std::string &ts)
+{
+    int year = 0, month = 0, day = 0;
+    if (!parse_date_from_ts(ts, year, month, day))
+        return "";
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << std::setw(2) << month;
+    return oss.str();
+}
+
+std::string week_key_from_ts(const std::string &ts)
+{
+    int year = 0, month = 0, day = 0;
+    if (!parse_date_from_ts(ts, year, month, day))
+        return "";
+
+    int week_num = calc_iso_week_num(year, month, day);
+    return format_week_key(year, week_num);
+}
+
+std::string quarter_key_from_ts(const std::string &ts)
+{
+    int year = 0, month = 0, day = 0;
+    if (!parse_date_from_ts(ts, year, month, day))
+        return "";
+
+    int quarter = (month - 1) / 3 + 1;
+    if (quarter < 1)
+        quarter = 1;
+    if (quarter > 4)
+        quarter = 4;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year
+        << 'Q' << quarter;
+    return oss.str();
+}
+
+std::string year_key_from_ts(const std::string &ts)
+{
+    int year = 0, month = 0, day = 0;
+    if (!parse_date_from_ts(ts, year, month, day))
+        return "";
+    (void)month;
+    (void)day;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(4) << year;
+    return oss.str();
+}
+
+std::string dedupe_key_for_row(const std::string &period, const CsvRow &row)
+{
+    if (period_is_month(period))
+    {
+        if (!row.month_key.empty())
+            return row.month_key;
+        std::string k = month_key_from_ts(row.ts);
+        return k.empty() ? row.ts : k;
+    }
+    if (period_is_week(period))
+    {
+        if (!row.week_key.empty())
+            return row.week_key;
+        std::string k = week_key_from_ts(row.ts);
+        return k.empty() ? row.ts : k;
+    }
+    if (period_is_quarter(period))
+    {
+        if (!row.quarter_key.empty())
+            return row.quarter_key;
+        std::string k = quarter_key_from_ts(row.ts);
+        return k.empty() ? row.ts : k;
+    }
+    if (period_is_year(period))
+    {
+        if (!row.year_key.empty())
+            return row.year_key;
+        std::string k = year_key_from_ts(row.ts);
+        return k.empty() ? row.ts : k;
+    }
+    return row.ts;
+}
+
 std::vector<std::string> split_csv_simple(const std::string &line)
 {
     std::vector<std::string> cols;
@@ -262,6 +508,16 @@ std::vector<std::string> split_csv_simple(const std::string &line)
     while (std::getline(ss, token, ','))
         cols.push_back(token);
     return cols;
+}
+
+std::string trim_ascii_ws(const std::string &s)
+{
+    const char *ws = " \t\r\n";
+    size_t begin = s.find_first_not_of(ws);
+    if (begin == std::string::npos)
+        return "";
+    size_t end = s.find_last_not_of(ws);
+    return s.substr(begin, end - begin + 1);
 }
 
 float parse_float(const std::string &s)
@@ -275,22 +531,52 @@ bool parse_csv_row(const std::string &line, CsvRow &row)
     if (cols.size() < 7)
         return false;
 
-    row.symbol = cols[0];
-    row.period = cols[1];
-    row.ts = cols[2];
+    row.symbol = trim_ascii_ws(cols[0]);
+    row.period = trim_ascii_ws(cols[1]);
+    row.ts = trim_ascii_ws(cols[2]);
     row.open = parse_float(cols[3]);
     row.high = parse_float(cols[4]);
     row.low = parse_float(cols[5]);
     row.close = parse_float(cols[6]);
     row.volume = (cols.size() >= 8) ? parse_float(cols[7]) : 0.0f;
     row.amount = (cols.size() >= 9) ? parse_float(cols[8]) : 0.0f;
+
+    if (row.period == "1w")
+    {
+        if (cols.size() >= 10)
+            row.week_key = trim_ascii_ws(cols[9]);
+        if (row.week_key.empty() && cols.size() >= 11)
+            row.week_key = trim_ascii_ws(cols[10]);
+    }
+    else if (row.period == "1mo")
+    {
+        if (cols.size() >= 10)
+            row.month_key = trim_ascii_ws(cols[9]);
+        if (row.month_key.empty() && cols.size() >= 11)
+            row.month_key = trim_ascii_ws(cols[10]);
+    }
+    else if (row.period == "1q")
+    {
+        if (cols.size() >= 10)
+            row.quarter_key = trim_ascii_ws(cols[9]);
+        if (row.quarter_key.empty() && cols.size() >= 11)
+            row.quarter_key = trim_ascii_ws(cols[10]);
+    }
+    else if (row.period == "1y")
+    {
+        if (cols.size() >= 10)
+            row.year_key = trim_ascii_ws(cols[9]);
+        if (row.year_key.empty() && cols.size() >= 11)
+            row.year_key = trim_ascii_ws(cols[10]);
+    }
+
     return (!row.symbol.empty() && !row.period.empty() && !row.ts.empty());
 }
 
 void load_existing_rows(const std::string &file_path,
                         const std::string &expect_symbol,
                         const std::string &expect_period,
-                        std::map<std::string, CsvRow> &rows_by_ts)
+                        std::map<std::string, CsvRow> &rows_by_key)
 {
     std::ifstream in(file_path, std::ios::in | std::ios::binary);
     if (!in.is_open())
@@ -310,7 +596,8 @@ void load_existing_rows(const std::string &file_path,
         if (row.symbol != expect_symbol || row.period != expect_period)
             continue;
 
-        rows_by_ts[row.ts] = row;
+        std::string dedupe_key = dedupe_key_for_row(expect_period, row);
+        rows_by_key[dedupe_key] = row;
     }
 }
 
@@ -338,6 +625,7 @@ void reset_state()
     g_state.has_period = false;
     g_state.has_date = false;
     g_state.has_time = false;
+    g_state.has_week = false;
     g_state.has_open = false;
     g_state.has_high = false;
     g_state.has_low = false;
@@ -352,6 +640,7 @@ void reset_state()
 
     g_state.date.clear();
     g_state.time.clear();
+    g_state.week.clear();
     g_state.open.clear();
     g_state.high.clear();
     g_state.low.clear();
@@ -370,6 +659,7 @@ void ensure_count(int nCount)
         g_state.count = nCount;
         g_state.date.assign(nCount, 0);
         g_state.time.assign(nCount, 0);
+        g_state.week.assign(nCount, 0);
         g_state.open.assign(nCount, 0);
         g_state.high.assign(nCount, 0);
         g_state.low.assign(nCount, 0);
@@ -414,13 +704,18 @@ bool write_csv()
     std::string file_path = join_path(base_dir, symbol_str + "." + period_str + ".csv");
 
     bool file_exists = (GetFileAttributesA(file_path.c_str()) != INVALID_FILE_ATTRIBUTES);
-    std::map<std::string, CsvRow> rows_by_ts;
+    std::map<std::string, CsvRow> rows_by_key;
 
     // Auto mode:
     // - file not exists: full export from current batch
-    // - file exists: incremental merge by ts, overwrite when same ts appears
+    // - file exists: incremental merge by dedupe key:
+    //   * 1mo -> month_key
+    //   * 1w  -> week_key
+    //   * 1q  -> quarter_key
+    //   * 1y  -> year_key
+    //   * others -> ts
     if (file_exists)
-        load_existing_rows(file_path, symbol_str, period_str, rows_by_ts);
+        load_existing_rows(file_path, symbol_str, period_str, rows_by_key);
 
     for (int i = 0; i < g_state.count; ++i)
     {
@@ -444,8 +739,49 @@ bool write_csv()
         row.volume = g_state.volume[i];
         row.amount = g_state.amount[i];
 
-        rows_by_ts[row.ts] = row;
+        if (period_is_month(period_str))
+        {
+            row.month_key = format_month_key(date);
+        }
+        else if (period_is_week(period_str))
+        {
+            int year = 0, month = 0, day = 0;
+            split_date(date, year, month, day);
+
+            int week_num = 0;
+            if (g_state.has_week && i < (int)g_state.week.size())
+                week_num = static_cast<int>(g_state.week[i]);
+            if (week_num <= 0 || week_num > 53)
+                week_num = calc_iso_week_num_from_date(date);
+
+            row.week_key = format_week_key(year, week_num);
+        }
+        else if (period_is_quarter(period_str))
+        {
+            row.quarter_key = format_quarter_key(date);
+        }
+        else if (period_is_year(period_str))
+        {
+            row.year_key = format_year_key(date);
+        }
+
+        std::string dedupe_key = dedupe_key_for_row(period_str, row);
+        rows_by_key[dedupe_key] = row;
     }
+
+    std::vector<CsvRow> rows;
+    rows.reserve(rows_by_key.size());
+    for (const auto &kv : rows_by_key)
+        rows.push_back(kv.second);
+
+    std::sort(rows.begin(), rows.end(),
+              [](const CsvRow &a, const CsvRow &b) {
+                  if (a.ts != b.ts)
+                      return a.ts < b.ts;
+                  if (a.period != b.period)
+                      return a.period < b.period;
+                  return a.symbol < b.symbol;
+              });
 
     std::ofstream out(file_path, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!out.is_open())
@@ -454,21 +790,41 @@ bool write_csv()
         return false;
     }
 
-    out << "symbol,period,ts,open,high,low,close,volume,amount\n";
-    for (const auto &kv : rows_by_ts)
+    if (period_is_week(period_str))
+        out << "symbol,period,ts,open,high,low,close,volume,amount,week_key\n";
+    else if (period_is_month(period_str))
+        out << "symbol,period,ts,open,high,low,close,volume,amount,month_key\n";
+    else if (period_is_quarter(period_str))
+        out << "symbol,period,ts,open,high,low,close,volume,amount,quarter_key\n";
+    else if (period_is_year(period_str))
+        out << "symbol,period,ts,open,high,low,close,volume,amount,year_key\n";
+    else
+        out << "symbol,period,ts,open,high,low,close,volume,amount\n";
+
+    for (const auto &row : rows)
     {
-        const CsvRow &row = kv.second;
         out << row.symbol << ',' << row.period << ',' << row.ts << ','
             << row.open << ',' << row.high << ','
             << row.low << ',' << row.close << ','
-            << row.volume << ',' << row.amount << '\n';
+            << row.volume << ',' << row.amount;
+
+        if (period_is_week(period_str))
+            out << ',' << row.week_key;
+        else if (period_is_month(period_str))
+            out << ',' << row.month_key;
+        else if (period_is_quarter(period_str))
+            out << ',' << row.quarter_key;
+        else if (period_is_year(period_str))
+            out << ',' << row.year_key;
+
+        out << '\n';
     }
 
     out.flush();
     LOG_INFO("Export done: %s (input=%d merged=%d existed=%d)",
              file_path.c_str(),
              g_state.count,
-             static_cast<int>(rows_by_ts.size()),
+             static_cast<int>(rows.size()),
              file_exists ? 1 : 0);
     return true;
 }
@@ -553,12 +909,11 @@ void Func1(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
     }
 }
 
-// Func2: date/time arrays
-// pIn1 = date (YYYYMMDD - 19000000), pIn2 = time (HHMM)
+// Func2: date/time/week arrays
+// pIn1 = date (YYYYMMDD - 19000000), pIn2 = time (HHMM), pIn3 = iso_week (1-53, optional)
 void Func2(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
 {
     (void)pOut;
-    (void)pIn3;
     ensure_count(nCount);
     if (pIn1)
     {
@@ -571,6 +926,12 @@ void Func2(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
         std::copy(pIn2, pIn2 + nCount, g_state.time.begin());
         g_state.has_time = true;
         LOG_INFO("Time array received: n=%d", nCount);
+    }
+    if (pIn3)
+    {
+        std::copy(pIn3, pIn3 + nCount, g_state.week.begin());
+        g_state.has_week = true;
+        LOG_INFO("Week array received: n=%d", nCount);
     }
 }
 
