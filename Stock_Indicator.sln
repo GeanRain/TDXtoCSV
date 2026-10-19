@@ -4,6 +4,11 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 17.14.36401.2
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SaveAsCSV", "SaveAsCSV\SaveAsCSV.vcxproj", "{69738107-8A65-499B-97E8-A6C5746C3D1B}"
+	ProjectSection(ProjectDependencies) = postProject
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD} = {0D9D80B0-B514-402C-AB5B-B95FC4E162BD}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SaveAsCSVWorker", "SaveAsCSVWorker\SaveAsCSVWorker.vcxproj", "{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -13,6 +18,12 @@ Global
 		Release|x86 = Release|x86
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Debug|x86.ActiveCfg = Debug|Win32
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Debug|x86.Build.0 = Debug|Win32
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Debug|x64.ActiveCfg = Debug|Win32
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Release|x86.ActiveCfg = Release|Win32
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Release|x86.Build.0 = Release|Win32
+		{0D9D80B0-B514-402C-AB5B-B95FC4E162BD}.Release|x64.ActiveCfg = Release|Win32
 		{69738107-8A65-499B-97E8-A6C5746C3D1B}.Debug|x64.ActiveCfg = Debug|x64
 		{69738107-8A65-499B-97E8-A6C5746C3D1B}.Debug|x64.Build.0 = Debug|x64
 		{69738107-8A65-499B-97E8-A6C5746C3D1B}.Debug|x86.ActiveCfg = Debug|Win32

@@ -71,7 +71,7 @@ bool IniReader::createDefaultFile() noexcept
 
 std::string IniReader::getString(const char* section,
                                  const char* key,
-                                 const char* defaultValue) const noexcept
+                                 const char* defaultValue) const
 {
     char buf[256]{};
 

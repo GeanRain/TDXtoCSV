@@ -35,16 +35,16 @@ enum class LogMode
 class Logger
 {
 public:
-    static void initialize(const std::string &dllPath);
+    static void initialize(const std::string &dllPath, const std::string &prefix = {});
     static void shutdown();
     static void clearConsole();
 
     static void log(const char *level, const char *fmt, ...);
 
 private:
-    static void logDebugView(const std::string &line);
-    static void logConsole(const std::string &line);
-    static void logFile(const std::string &line);
+    static void logDebugView(const char *line);
+    static void logConsole(const char *line, DWORD length);
+    static void logFile(const char *line, DWORD length);
 
 private:
     static LogMode s_mode;

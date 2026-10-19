@@ -48,8 +48,11 @@
 /x64
 
 # packet output
+/tests/.runtime/
 /CHAN/Debug
 /CHAN/x64
 /DebugTool/Debug
 /DebugTool/x64
 
+/SaveAsCSVWorker/.build/
+!/Release/SaveAsCSVWorker.exe

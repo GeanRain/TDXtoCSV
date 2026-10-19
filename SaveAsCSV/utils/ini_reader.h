@@ -34,7 +34,7 @@ public:
 
     std::string getString(const char *section,
                           const char *key,
-                          const char *defaultValue) const noexcept;
+                          const char *defaultValue) const;
 
     int getInt(const char *section,
                const char *key,

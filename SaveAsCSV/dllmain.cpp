@@ -11,28 +11,32 @@
 #include "common.h"
 #include "utils/logger.h"
 #include "utils/ini_reader.h"
+#include "export/async_writer.h"
 
 std::string config_file_dir;
 const char *kDefaultIni =
     R"ini(
 [log]
-mode=disable
+mode=file
 level=1
 file=saveAsCSV.log
 
 [export]
 csv_dir=
-append=0
 symbol_width=6
-symbol_suffix=XX
-tz=+08
 default_time=150000
+
+[async]
+queue_capacity=1000
+queue_memory_mb=2048
+worker_threads=8
+worker_path=SaveAsCSVWorker.exe
 )ini";
 
 
 BOOL APIENTRY DllMain(HMODULE hModule,
                       DWORD reason,
-                      LPVOID)
+                      LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
@@ -44,8 +48,9 @@ BOOL APIENTRY DllMain(HMODULE hModule,
         config_file_dir.assign((p == std::string::npos) ? path : path.substr(0, p));
         Logger::initialize(config_file_dir);
     }
-    else if (reason == DLL_PROCESS_DETACH)
+    else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {
+        tdx_export::dispose_export_writer();
         Logger::shutdown();
     }
     return TRUE;

@@ -20,6 +20,9 @@
 #include "ini_reader.h"
 
 #include "../common.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 
 LogMode Logger::s_mode = LogMode::Disabled;
 bool Logger::s_level_debug_en = false;
@@ -35,7 +38,7 @@ static std::string dirname(const std::string &path)
     return (p == std::string::npos) ? path : path.substr(0, p);
 }
 
-void Logger::initialize(const std::string &dllPath)
+void Logger::initialize(const std::string &dllPath, const std::string &prefix)
 {
     InitializeCriticalSection(&s_lock);
 
@@ -67,12 +70,12 @@ void Logger::initialize(const std::string &dllPath)
         std::string fileName =
             ini.getString("log", "file", "saveAsCVS.log");
 
-        std::string fullPath = dllPath + "\\" + day_time + fileName;
+        std::string fullPath = dllPath + "\\" + day_time + prefix + fileName;
 
         s_file = CreateFileA(
             fullPath.c_str(),
             FILE_APPEND_DATA,
-            FILE_SHARE_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
             OPEN_ALWAYS,
             FILE_ATTRIBUTE_NORMAL,
@@ -189,28 +192,28 @@ void Logger::log(const char *level, const char *fmt, ...)
 
     do
     {
-        if (level == "DEBUG")
+        if (std::strcmp(level, "DEBUG") == 0)
         {
             if (!s_level_debug_en)
                 return;
             else
                 break;
         }
-        if (level == "INFO")
+        if (std::strcmp(level, "INFO") == 0)
         {
             if (!s_level_info_en)
                 return;
             else
                 break;
         }
-        if (level == "WARN")
+        if (std::strcmp(level, "WARN") == 0)
         {
             if (!s_level_warn_en)
                 return;
             else
                 break;
         }
-        if (level == "ERROR")
+        if (std::strcmp(level, "ERROR") == 0)
         {
             if (!s_level_error_en)
                 return;
@@ -227,13 +230,16 @@ void Logger::log(const char *level, const char *fmt, ...)
               st.wHour, st.wMinute, st.wSecond, level);
 
     // 格式化可变参数消息
-    char message[1024]; // 可根据需要调整大小
+    char message[1024]{};
     va_list args;
     va_start(args, fmt);
     vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
 
-    std::string line = std::string(header) + message + "\n";
+    // 内存不足时日志仍须可写，整条输出不申请 C++ 堆内存。
+    char line[sizeof(header) + sizeof(message) + 1]{};
+    snprintf(line, sizeof(line), "%s%s\n", header, message);
+    const auto length = static_cast<DWORD>(std::strlen(line));
 
     EnterCriticalSection(&s_lock);
 
@@ -243,10 +249,10 @@ void Logger::log(const char *level, const char *fmt, ...)
         logDebugView(line);
         break;
     case LogMode::Console:
-        logConsole(line);
+        logConsole(line, length);
         break;
     case LogMode::File:
-        logFile(line);
+        logFile(line, length);
         break;
     default:
         break;
@@ -255,30 +261,30 @@ void Logger::log(const char *level, const char *fmt, ...)
     LeaveCriticalSection(&s_lock);
 }
 
-void Logger::logDebugView(const std::string &line)
+void Logger::logDebugView(const char *line)
 {
-    OutputDebugStringA(line.c_str());
+    OutputDebugStringA(line);
 }
 
-void Logger::logConsole(const std::string &line)
+void Logger::logConsole(const char *line, DWORD length)
 {
     DWORD written;
     WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE),
-                  line.c_str(),
-                  (DWORD)line.size(),
+                  line,
+                  length,
                   &written,
                   nullptr);
 }
 
-void Logger::logFile(const std::string &line)
+void Logger::logFile(const char *line, DWORD length)
 {
     if (s_file == INVALID_HANDLE_VALUE)
         return;
 
     DWORD written;
     WriteFile(s_file,
-              line.c_str(),
-              (DWORD)line.size(),
+              line,
+              length,
               &written,
               nullptr);
 }
