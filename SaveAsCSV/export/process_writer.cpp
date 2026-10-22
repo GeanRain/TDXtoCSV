@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <mutex>
+#include <type_traits>
 namespace tdx_export
 {
 using namespace ipc;
@@ -14,14 +15,16 @@ struct ProcessWriter::Impl
 {
     std::mutex mutex;
     const std::wstring directory,base;std::wstring executable;
+    const HANDLE lifetime_job;const std::uint64_t lifetime;
     const std::uint64_t created=creation_time(GetCurrentProcess());
     Channel control,data;Handle process,stop;
     std::uint64_t epoch=0,connection=0,acknowledged=0;std::atomic<std::uint64_t> rejected{0},waiting{0};
     AsyncLimits limits;WriterStatus cached;
     DWORD backend_pid=0;bool active=false;std::atomic<bool> reported{false},fault{false};std::uint64_t request_serial=0;
     std::string stop_name;
-    explicit Impl(const std::string &dir):directory(wide(dir)),
-        base(pipe_base(GetCurrentProcessId(),creation_time(GetCurrentProcess()),directory)){}
+    Impl(const std::string &dir,HANDLE job,std::uint64_t generation):directory(wide(dir)),
+        base(pipe_base(GetCurrentProcessId(),creation_time(GetCurrentProcess()),directory,generation)),lifetime_job(job),lifetime(generation)
+    {if(bool(job)!=(generation!=0))throw Rejected("后台生命周期句柄与标识不完整");}
     std::wstring configured_executable(const std::string &relative={})
     {
         if(!relative.empty())return relative_executable(directory,relative);
@@ -72,15 +75,30 @@ struct ProcessWriter::Impl
             check_process();
             if(discovery&&error==ERROR_FILE_NOT_FOUND&&!epoch)return {};
             if(error==ERROR_FILE_NOT_FOUND&&launch&&!started&&!epoch){
-                const auto arguments=L"\""+executable+L"\" --parent "+std::to_wstring(GetCurrentProcessId())+L" "+std::to_wstring(created)+L" \""+directory+L"\"";
-                std::vector<wchar_t> command(arguments.begin(),arguments.end());command.push_back(0);STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};
-                try{LOG_INFO("准备启动独立后台 path=%s",narrow(executable).c_str());}catch(...){}
-                if(!CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,directory.c_str(),&si,&pi)){
-                    const auto error=GetLastError();
-                    try{LOG_ERROR("创建独立后台失败 Windows=%lu path=%s",error,narrow(executable).c_str());}catch(...){}
-                    SetLastError(error);win_error("启动独立保存程序");
+                auto arguments=L"\""+executable+L"\" --parent "+std::to_wstring(GetCurrentProcessId())+L" "+std::to_wstring(created)+L" \""+directory+L"\"";
+                if(lifetime)arguments+=L" "+std::to_wstring(lifetime);
+                std::vector<wchar_t> command(arguments.begin(),arguments.end());command.push_back(0);
+                STARTUPINFOEXW si{};si.StartupInfo.cb=lifetime_job?sizeof(si):sizeof(si.StartupInfo);PROCESS_INFORMATION pi{};
+                std::vector<unsigned char> storage;
+                HANDLE job_attribute=lifetime_job;
+                std::unique_ptr<std::remove_pointer_t<LPPROC_THREAD_ATTRIBUTE_LIST>,decltype(&DeleteProcThreadAttributeList)> attributes(nullptr,DeleteProcThreadAttributeList);
+                if(lifetime_job){
+                    SIZE_T size=0;InitializeProcThreadAttributeList(nullptr,1,0,&size);if(!size)win_error("读取后台进程属性长度");
+                    storage.resize(size);auto list=reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+                    if(!InitializeProcThreadAttributeList(list,1,0,&size))win_error("初始化后台进程属性");
+                    attributes.reset(list);
+                    // 创建与入作业必须是同一次系统调用，避免宿主退出留下未管理的后台。
+                    if(!UpdateProcThreadAttribute(list,0,PROC_THREAD_ATTRIBUTE_JOB_LIST,&job_attribute,sizeof(job_attribute),nullptr,nullptr))win_error("设置后台生命周期属性，需要Windows 10或更新版本");
+                    si.lpAttributeList=list;
                 }
-                CloseHandle(pi.hThread);process.reset(pi.hProcess);started=true;
+                try{LOG_INFO("准备启动独立后台 path=%s",narrow(executable).c_str());}catch(...){}
+                if(!CreateProcessW(executable.c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|(lifetime_job?EXTENDED_STARTUPINFO_PRESENT:0),nullptr,directory.c_str(),&si.StartupInfo,&pi)){
+                    const auto launch_error=GetLastError();
+                    try{LOG_ERROR("创建独立后台失败 Windows=%lu path=%s",launch_error,narrow(executable).c_str());}catch(...){}
+                    SetLastError(launch_error);win_error("启动独立保存程序");
+                }
+                Handle thread(pi.hThread);process.reset(pi.hProcess);
+                started=true;
                 try{LOG_INFO("独立后台进程已创建 pid=%lu，等待管道握手",pi.dwProcessId);}catch(...){}
             }
             if(GetTickCount64()-begin>10000)throw Rejected("独立后台启动或管道连接超时");
@@ -141,8 +159,8 @@ struct ProcessWriter::Impl
         cached.waiting+=waiting.load();return cached;
     }
 };
-ProcessWriter::ProcessWriter(const std::string &directory):impl_(new Impl(directory)){}
-ProcessWriter::~ProcessWriter()=default; // 只关闭本端句柄，不能随 DLL 卸载结束独立后台。
+ProcessWriter::ProcessWriter(const std::string &directory,HANDLE job,std::uint64_t lifetime):impl_(new Impl(directory,job,lifetime)){}
+ProcessWriter::~ProcessWriter()=default; // DLL 卸载通过独占作业句柄结束后台，此处不等待管道或排空。
 void ProcessWriter::start(AsyncLimits limits,const std::string &csv_dir,const std::string &worker_path)
 {
     auto &p=*impl_;std::lock_guard<std::mutex> lock(p.mutex);

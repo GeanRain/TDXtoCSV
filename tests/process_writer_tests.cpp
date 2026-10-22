@@ -103,6 +103,14 @@ int main(int argc,char **argv){
         const auto text=read(f.dir/"csv"/"600000.SH.1d.csv");check(std::count(text.begin(),text.end(),'\n')==3,"CSV不完整");
         check(fs::exists(f.dir/"csv"/"_bg_0-4_0-2"),"状态未归零");
     });
+    run("真实后台重复任务跳过写盘仍释放额度并报告成功",[&]{
+        Fixture f(production,root/"unchanged");f.start();submit(f,job(f));wait_until([&]{return f.writer->status().unfinished==0;},"首次保存未完成");
+        const auto file=f.dir/"csv"/"600000.SH.1d.csv";const auto original=read(file);const auto modified=fs::last_write_time(file);
+        Handle hold(CreateFileW(file.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));check(bool(hold),"无法锁定原文件禁止替换");
+        submit(f,job(f));submit(f,job(f));check(f.finish(),"重复任务应成功排空");const auto s=f.writer->status();
+        check(s.accepted==3&&s.succeeded==3&&!s.failed&&!s.bytes&&!s.unfinished,"跳过写盘仍须计为成功并释放全部额度");
+        check(read(file)==original&&fs::last_write_time(file)==modified,"重复导出不得修改CSV");check(f.logs().find("数据未变化，跳过写盘：")!=std::string::npos,"真实后台缺少跳过写盘日志");
+    });
     for(const std::string variable:{"TDX_TEST_DROP_RESERVE","TDX_TEST_DROP_COMMIT","TDX_TEST_DROP_FINAL"})run(("已执行后丢回包可恢复 "+variable).c_str(),[&]{
         Fixture f(injected,root/variable,4,128,2,"SaveAsCSVWorker.exe",{{variable,"1"}});f.start();submit(f,job(f));check(f.finish(),"丢回包后排空失败");
         const auto s=f.writer->status();check(s.accepted==1&&s.succeeded==1&&!s.reserved&&!s.bytes,"丢回包造成重复接收或额度泄漏");

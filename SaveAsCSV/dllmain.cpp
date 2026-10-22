@@ -14,6 +14,26 @@
 #include "export/async_writer.h"
 
 std::string config_file_dir;
+// DLL 独占此句柄；卸载时关闭，Windows 终止其中所有后台进程。
+HANDLE backend_job = nullptr;
+std::uint64_t backend_lifetime = 0;
+bool reset_backend_lifetime() noexcept
+{
+    if (backend_job) CloseHandle(backend_job);
+    backend_job = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    LARGE_INTEGER generation{};
+    if (!backend_job || !SetInformationJobObject(backend_job, JobObjectExtendedLimitInformation, &limits, sizeof(limits)) ||
+        !QueryPerformanceCounter(&generation) || generation.QuadPart <= 0)
+    {
+        if (backend_job) CloseHandle(backend_job);
+        backend_job = nullptr;
+        return false;
+    }
+    backend_lifetime = static_cast<std::uint64_t>(generation.QuadPart);
+    return true;
+}
 const char *kDefaultIni =
     R"ini(
 [log]
@@ -47,11 +67,21 @@ BOOL APIENTRY DllMain(HMODULE hModule,
         config_file_dir.reserve(MAX_PATH);
         config_file_dir.assign((p == std::string::npos) ? path : path.substr(0, p));
         Logger::initialize(config_file_dir);
+        if (!reset_backend_lifetime())
+        {
+            Logger::shutdown();
+            return FALSE;
+        }
     }
-    else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
+    else if (reason == DLL_PROCESS_DETACH)
     {
-        tdx_export::dispose_export_writer();
-        Logger::shutdown();
+        if (backend_job) CloseHandle(backend_job);
+        backend_job = nullptr;
+        if (reserved == nullptr)
+        {
+            tdx_export::dispose_export_writer();
+            Logger::shutdown();
+        }
     }
     return TRUE;
 }

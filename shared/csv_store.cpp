@@ -435,7 +435,8 @@ bool write_csv(ExportJob &s)
         return save_reject("目标正在导出，或无法创建写锁，请稍后重跑");
     std::map<std::string, CsvRow> rows;
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
-    if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes))
+    const bool exists = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes) != FALSE;
+    if (exists)
     {
         if ((attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
             attributes.nFileSizeHigh || attributes.nFileSizeLow > kMaxCsvBytes ||
@@ -457,6 +458,53 @@ bool write_csv(ExportJob &s)
     for (const auto &entry : rows) ordered.push_back(&entry.second);
     std::sort(ordered.begin(), ordered.end(),
               [](const CsvRow *a, const CsvRow *b) { return a->ts < b->ts; });
+    const std::string extra = key_column(s.period);
+    std::string header = kHeader;
+    if (!extra.empty()) { header.push_back(','); header.append(extra); }
+    header.push_back('\n');
+    std::string line;
+    line.reserve(192);
+    auto format_row = [&](const CsvRow *row)
+    {
+        line.clear();line.append(row->symbol).push_back(',');line.append(row->period).push_back(',');line.append(row->ts);
+        // 同原流的double转换和六位有效数字，比较和写入共用同一格式。
+        for(float value:row->values){
+            char text[64];const auto formatted=std::to_chars(text,text+sizeof(text),static_cast<double>(value),std::chars_format::general,6);
+            if(formatted.ec!=std::errc{})return save_reject("数值格式化缓冲不足，已保留原文件");
+            line.push_back(',');line.append(text,static_cast<std::size_t>(formatted.ptr-text));
+        }
+        if(!extra.empty()){line.push_back(',');line.append(row->key);}
+        line.push_back('\n');
+        return true;
+    };
+    if (exists)
+    {
+        // 所有校验及合并通过后，逐段比较实际输出字节，不缓存整份CSV。
+        std::ifstream original;
+        original.exceptions(std::ios::badbit);
+        original.open(path, std::ios::binary);
+        if (!original.is_open()) return save_reject("无法重新读取旧 CSV，已停止覆盖");
+        std::string buffer;
+        auto matches = [&](const std::string &expected)
+        {
+            buffer.resize(expected.size());
+            original.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            return original.gcount() == static_cast<std::streamsize>(buffer.size()) && buffer == expected;
+        };
+        bool same = matches(header);
+        for (const CsvRow *row : ordered)
+        {
+            if (!same) break;
+            if (!format_row(row)) return false;
+            same = matches(line);
+        }
+        if (same && original.peek() == std::char_traits<char>::eof())
+        {
+            try { LOG_INFO("数据未变化，跳过写盘：%s，本次 %d 条，合并后 %u 条",
+                           path.c_str(), s.count, static_cast<unsigned>(rows.size())); } catch (...) {}
+            return true;
+        }
+    }
     timing.next();
     TempFile temp;
     if (!GetTempFileNameA(s.csv_dir.c_str(), "tdx", 0, temp.path))
@@ -469,23 +517,11 @@ bool write_csv(ExportJob &s)
     output.open(temp.path, std::ios::binary | std::ios::trunc);
     output.imbue(std::locale::classic());
     if (!output.is_open()) return save_reject("无法打开临时文件");
-    output << kHeader;
-    std::string extra = key_column(s.period);
-    if (!extra.empty()) output << ',' << extra;
-    output << '\n';
-    std::string line;
-    line.reserve(192);
+    output.write(header.data(), static_cast<std::streamsize>(header.size()));
     for (const CsvRow *row : ordered)
     {
-        line.clear();line.append(row->symbol).push_back(',');line.append(row->period).push_back(',');line.append(row->ts);
-        // 同原流的double转换和六位有效数字，复用行缓冲，避免逐值locale/流构造开销。
-        for(float value:row->values){
-            char text[64];const auto formatted=std::to_chars(text,text+sizeof(text),static_cast<double>(value),std::chars_format::general,6);
-            if(formatted.ec!=std::errc{})return save_reject("数值格式化缓冲不足，已保留原文件");
-            line.push_back(',');line.append(text,static_cast<std::size_t>(formatted.ptr-text));
-        }
-        if(!extra.empty()){line.push_back(',');line.append(row->key);}
-        line.push_back('\n');output.write(line.data(),static_cast<std::streamsize>(line.size()));
+        if (!format_row(row)) return false;
+        output.write(line.data(), static_cast<std::streamsize>(line.size()));
     }
     output.flush();
     bool written = output.good();

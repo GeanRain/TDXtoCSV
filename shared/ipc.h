@@ -52,7 +52,7 @@ std::wstring wide(const std::string &text);
 std::string narrow(const std::wstring &text);
 std::wstring relative_executable(const std::wstring &directory,const std::string &relative);
 std::uint64_t creation_time(HANDLE process);
-std::wstring pipe_base(DWORD pid,std::uint64_t created,const std::wstring &directory);
+std::wstring pipe_base(DWORD pid,std::uint64_t created,const std::wstring &directory,std::uint64_t lifetime=0);
 [[noreturn]] void win_error(const char *operation);
 
 // 每条连接复用事件；所有在途操作结束后才能销毁缓冲或连接。

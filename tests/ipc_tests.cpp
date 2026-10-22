@@ -13,6 +13,8 @@ int main(){
         Buffer b;b.u32(0x89abcdef);b.u64(0xfedcba9876543210ULL);b.str("600000.SH");b.real(0.125);
         Reader r(b.data);check(r.u32()==0x89abcdef&&r.u64()==0xfedcba9876543210ULL&&r.str()=="600000.SH"&&r.real()==0.125&&r.done(),"固定宽度字段往返无损");
         check(crc32(0,"123456789",9)==0xcbf43926,"CRC32匹配公开已知向量");
+        check(pipe_base(1,2,L"D:\\tdx",3)!=pipe_base(1,2,L"D:\\tdx",4),"不同DLL装载周期使用独立管道");
+        check(pipe_base(1,2,L"D:\\tdx")!=pipe_base(1,2,L"D:\\tdx",3),"DLL管道与无生命周期的独立客户端隔离");
         auto crc=crc32(0,"1234",4);check(crc32(crc,"56789",5)==0xcbf43926,"分块CRC32与完整计算一致");
         bool denied=false;try{r.u32();}catch(const std::exception &){denied=true;}check(denied,"拒绝截断字段");
         Buffer invalid;invalid.u32(4096);Reader bad(invalid.data);denied=false;try{bad.str();}catch(const std::exception &){denied=true;}check(denied,"拒绝超出消息正文的字符串长度");

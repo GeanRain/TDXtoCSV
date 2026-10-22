@@ -77,11 +77,13 @@ std::string narrow(const std::wstring &text)
     if(!size||used)throw std::runtime_error("路径不能以本地代码页无损表示");std::string result(size,'\0');
     if(!WideCharToMultiByte(CP_ACP,flags,text.data(),static_cast<int>(text.size()),result.data(),size,nullptr,fallback)||used)throw std::runtime_error("路径转换失败");return result;
 }
-std::wstring pipe_base(DWORD pid,std::uint64_t created,const std::wstring &directory)
+std::wstring pipe_base(DWORD pid,std::uint64_t created,const std::wstring &directory,std::uint64_t lifetime)
 {
     std::uint64_t hash=14695981039346656037ULL;
     for(auto c:directory){if(c>=L'A'&&c<=L'Z')c+=L'a'-L'A';if(c==L'/')c=L'\\';hash^=static_cast<std::uint16_t>(c);hash*=1099511628211ULL;}
-    return L"\\\\.\\pipe\\SaveAsCSV_"+std::to_wstring(pid)+L"_"+std::to_wstring(created)+L"_"+std::to_wstring(hash);
+    auto base=L"\\\\.\\pipe\\SaveAsCSV_"+std::to_wstring(pid)+L"_"+std::to_wstring(created)+L"_"+std::to_wstring(hash);
+    if(lifetime)base+=L"_"+std::to_wstring(lifetime);
+    return base;
 }
 std::wstring relative_executable(const std::wstring &directory,const std::string &relative)
 {

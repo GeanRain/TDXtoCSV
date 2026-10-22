@@ -29,6 +29,11 @@
 #include "../../utils/logger.h"
 
 extern std::string config_file_dir;
+#ifndef TDX_EXPORT_INPROCESS_TEST
+extern HANDLE backend_job;
+extern std::uint64_t backend_lifetime;
+extern bool reset_backend_lifetime() noexcept;
+#endif
 
 namespace
 {
@@ -41,6 +46,7 @@ struct ExportState : ExportJob
     bool failed = false;
     int stage = 0;
     std::uint64_t reservation = 0;
+    std::uint64_t lifetime = 0;
     std::string worker_path;
 };
 
@@ -48,6 +54,14 @@ ExportState &state()
 {
     // 同一线程先完成一个品种的全部调用，再开始下一品种。
     static thread_local ExportState current;
+#ifndef TDX_EXPORT_INPROCESS_TEST
+    if (current.lifetime != backend_lifetime)
+    {
+        // 重新注册时旧后台已经结束，旧线程暂存和预留不能混入新后台。
+        current = ExportState{};
+        current.lifetime = backend_lifetime;
+    }
+#endif
     return current;
 }
 
@@ -68,7 +82,7 @@ ExportWriter &writer()
 #ifdef TDX_EXPORT_INPROCESS_TEST
             export_writer = new ExportWriter(perform_save);
 #else
-            export_writer = new ExportWriter(config_file_dir);
+            export_writer = new ExportWriter(config_file_dir, backend_job, backend_lifetime);
 #endif
     }
     catch (...) { ReleaseSRWLockExclusive(&writer_init_lock); throw; }
@@ -230,24 +244,26 @@ int config_integer(IniReader &ini, const char *name, const char *fallback, const
     return result;
 }
 
-tdx_export::AsyncLimits load_config()
+struct ExportConfig
 {
-    auto &s = state();
+    int default_time = 150000, width = 6;
+    std::string csv_dir, worker_path;
+    AsyncLimits limits;
+};
+
+ExportConfig load_config()
+{
+    ExportConfig result;
     std::string ini_path = join_path(config_file_dir, INIREADER_FILENAME);
     IniReader ini(ini_path, kDefaultIni);
     std::ifstream config;
     config.exceptions(std::ios::badbit);
     config.open(ini_path, std::ios::binary);
     if (!ini.isValid() || !config.is_open()) throw std::runtime_error("配置文件无法读取");
-    s.default_time = config_integer(ini, "default_time", "150000");
-    int width = config_integer(ini, "symbol_width", "6");
-    if (!valid_time(s.default_time) || width < 1 || width > 12)
+    result.default_time = config_integer(ini, "default_time", "150000");
+    result.width = config_integer(ini, "symbol_width", "6");
+    if (!valid_time(result.default_time) || result.width < 1 || result.width > 12)
         throw std::runtime_error("时间或代码位数配置无效");
-    std::ostringstream symbol;
-    symbol.exceptions(std::ios::badbit);
-    symbol.imbue(std::locale::classic());
-    symbol << std::setfill('0') << std::setw(width) << s.symbol;
-    s.symbol = symbol.str();
     std::string base = ini.getString("export", "csv_dir", "");
     if (base.size() >= 255) throw std::runtime_error("输出路径过长");
     if (base.empty()) base = join_path(config_file_dir, "csv");
@@ -259,22 +275,23 @@ tdx_export::AsyncLimits load_config()
     char absolute[MAX_PATH];
     DWORD size = GetFullPathNameA(base.c_str(), MAX_PATH, absolute, nullptr);
     if (!size || size >= MAX_PATH) throw std::runtime_error("输出路径无效或过长");
-    s.csv_dir = absolute;
+    result.csv_dir = absolute;
     int capacity = config_integer(ini, "queue_capacity", "1000", "async");
     int megabytes = config_integer(ini, "queue_memory_mb", "2048", "async");
     int workers = config_integer(ini, "worker_threads", "8", "async");
-    s.worker_path = ini.getString("async", "worker_path", "SaveAsCSVWorker.exe");
+    result.worker_path = ini.getString("async", "worker_path", "SaveAsCSVWorker.exe");
     if (capacity <= 0 || megabytes <= 0) throw std::runtime_error("异步队列数量和内存上限必须大于零");
     if (workers < 1 || workers > static_cast<int>(tdx_export::kMaxWorkers)) throw std::runtime_error("后台保存线程数必须在 1 到 128 之间");
-    return {static_cast<std::size_t>(capacity), static_cast<std::uint64_t>(megabytes) * 1024 * 1024,
-            static_cast<std::size_t>(workers)};
+    result.limits = {static_cast<std::size_t>(capacity), static_cast<std::uint64_t>(megabytes) * 1024 * 1024,
+                     static_cast<std::size_t>(workers)};
+    return result;
 }
 
 } // namespace
 
 void tdx_export::dispose_export_writer() noexcept
 {
-    // 正常卸载只关闭本端连接，独立进程继续保存；不能在 DllMain 中等待排空。
+    // DllMain 已关闭作业句柄结束后台；此处只释放代理，不进行管道调用或等待。
     delete export_writer;
     export_writer = nullptr;
 }
@@ -290,6 +307,9 @@ void Func4(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
         auto &s = state();
         release_current();
         s = ExportState{};
+#ifndef TDX_EXPORT_INPROCESS_TEST
+        s.lifetime = backend_lifetime;
+#endif
         int code = 0, market = 0, period = 0;
         if (!pIn1 || !pIn2 || !pIn3 || !integer(pIn1[0], 0, 999999, code) ||
             !integer(pIn2[0], 0, 65535, market) || market_suffix(market).empty() ||
@@ -297,15 +317,22 @@ void Func4(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
             return reject("代码、市场或周期输入无效");
         s.count = nCount;
         s.native_period = period;
-        s.symbol = std::to_string(code);
-        const auto limits = load_config();
+        const auto config = load_config();
+        s.default_time = config.default_time;
+        s.csv_dir = config.csv_dir;
+        s.worker_path = config.worker_path;
+        std::ostringstream symbol;
+        symbol.exceptions(std::ios::badbit);
+        symbol.imbue(std::locale::classic());
+        symbol << std::setfill('0') << std::setw(config.width) << code;
+        s.symbol = symbol.str();
         if (first_call) try { LOG_INFO("首次导出配置读取完成 worker_path=%s csv_dir=%s", s.worker_path.c_str(), s.csv_dir.c_str()); } catch (...) {}
         s.symbol += "." + market_suffix(market);
         s.caller_thread = GetCurrentThreadId();
 #ifdef TDX_EXPORT_INPROCESS_TEST
-        writer().start(limits, s.csv_dir);
+        writer().start(config.limits, s.csv_dir);
 #else
-        writer().start(limits, s.csv_dir, s.worker_path);
+        writer().start(config.limits, s.csv_dir, s.worker_path);
 #endif
         s.reservation = writer().reserve(tdx_export::job_memory(s) + static_cast<std::uint64_t>(nCount) * 32);
         // 完整接收前先分配数组，后续 assign/resize 不再重复申请整份空间。
@@ -477,6 +504,31 @@ static PluginTCalcFuncInfo Info[] =
 BOOL RegisterTdxFunc(PluginTCalcFuncInfo **pInfo)
 {
     if (!pInfo || *pInfo) return FALSE;
+#ifndef TDX_EXPORT_INPROCESS_TEST
+    // 注册发生在 DllMain 返回后；不能在持有装卸锁时启动进程或等待管道。
+    try
+    {
+        if (export_writer)
+        {
+            // 兼容宿主仅重新注册、未真正 FreeLibrary 的重新绑定方式。
+            const bool ready = reset_backend_lifetime();
+            tdx_export::dispose_export_writer();
+            if (!ready) throw std::runtime_error("无法重新建立后台生命周期");
+        }
+        const auto config = load_config();
+        writer().start(config.limits, config.csv_dir, config.worker_path);
+    }
+    catch (const std::exception &error)
+    {
+        try { LOG_ERROR("DLL绑定时启动后台失败：%s", error.what()); } catch (...) {}
+        return FALSE;
+    }
+    catch (...)
+    {
+        try { LOG_ERROR("%s", "DLL绑定时启动后台发生异常"); } catch (...) {}
+        return FALSE;
+    }
+#endif
     *pInfo = Info;
     try { LOG_INFO("DLL接口注册成功 functions=8 pid=%lu", GetCurrentProcessId()); } catch (...) {}
     return TRUE;

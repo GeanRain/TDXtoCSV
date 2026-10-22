@@ -37,7 +37,9 @@ void operator delete(void *memory) noexcept {std::free(memory);}
 void operator delete[](void *memory) noexcept {std::free(memory);}
 void operator delete(void *memory,std::size_t) noexcept {std::free(memory);}
 void operator delete[](void *memory,std::size_t) noexcept {std::free(memory);}
+std::atomic<unsigned> temp_file_calls{0};
 UINT WINAPI fault_temp_file(LPCSTR directory,LPCSTR prefix,UINT unique,LPSTR name) {
+    ++temp_file_calls;
     const auto result=GetTempFileNameA(directory,prefix,unique,name);
     if(result&&allocation_fault::temp_failures.load()>0) {
         --allocation_fault::temp_failures;allocation_fault::fail_next=true;
@@ -318,6 +320,11 @@ BY_HANDLE_FILE_INFORMATION file_identity(const fs::path &path) {
     FileHandle handle(CreateFileA(path.string().c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr));
     BY_HANDLE_FILE_INFORMATION info{};check(GetFileInformationByHandle(handle.value,&info)!=FALSE,"无法取得状态文件标识");return info;
 }
+void unchanged_file(const fs::path &path,const BY_HANDLE_FILE_INFORMATION &before) {
+    const auto after=file_identity(path);
+    check(after.dwVolumeSerialNumber==before.dwVolumeSerialNumber&&after.nFileIndexHigh==before.nFileIndexHigh&&after.nFileIndexLow==before.nFileIndexLow,"无变化时不能替换原文件");
+    check(CompareFileTime(&after.ftLastWriteTime,&before.ftLastWriteTime)==0,"无变化时不能更新原文件修改时间");
+}
 struct SavingBarrier {
     SavingBarrier(){std::lock_guard<std::mutex> lock(captured_log::mutex);captured_log::held=0;captured_log::save_permits=0;captured_log::hold_saved=true;}
     void one(){std::lock_guard<std::mutex> lock(captured_log::mutex);++captured_log::save_permits;captured_log::changed.notify_all();}
@@ -482,7 +489,66 @@ void suite() {
             contains(csv, minute ? "2026-10-16 10:30:00" : "2026-10-16 15:00:00");
             check(lines(csv) == (p.code == 6 || p.code == 7 || p.code == 11 ? 2u : 3u), "输出行数不正确");
         });
+        run(std::string("完全一致跳过写盘 ")+p.label,[=]{
+            Fixture f;Batch first(2,p.code);first.complete({1261015,1261016},{930,1030});
+            const auto original=read(f.file(p.label));const auto identity=file_identity(f.file(p.label));const auto attempts=temp_file_calls.load();
+            reset_logs();Batch repeat(2,p.code);repeat.complete({1261015,1261016},{930,1030});
+            unchanged_file(f.file(p.label),identity);check(read(f.file(p.label))==original,"跳过写盘不能改变内容");
+            check(temp_file_calls==attempts,"完全一致时不能创建临时CSV");
+            const auto logs=current_logs();check(std::any_of(logs.begin(),logs.end(),[](const auto &entry){return entry.message.rfind("数据未变化，跳过写盘：",0)==0;}),"跳过写盘应有明确日志");
+            if(p.code==5){check_reports(logs,"ok",2);check(metric_number(report_fields(logs,"保存分段"),"write_ms")==0,"跳过写盘的写入耗时必须为零");}
+        });
     }
+
+    run("仅重叠历史片段未变化仍跳过写盘",[]{
+        Fixture f;Batch first(3);first.complete({1261014,1261015,1261016});const auto original=read(f.file());const auto identity=file_identity(f.file());
+        Batch partial;partial.complete({1261015});unchanged_file(f.file(),identity);check(read(f.file())==original,"未重新导出的历史必须保留");
+    });
+    run("六位有效数字舍入及极值重复导出跳过写盘",[]{
+        Fixture f;
+        for(int pass=0;pass<2;++pass){
+            const auto attempts=temp_file_calls.load();Batch b;status(b.dates({1261016}),1,"日期");
+            const float v[]={0,10.1234567f,11.1234567f,12.1234567f,9.1234567f,12345678.f,FLT_MAX};
+            for(int type=1;type<=6;++type)status(b.field(type,{v[type]}),1,"字段");status(b.save(),1,"保存");
+            if(pass)check(temp_file_calls==attempts,"原始浮点值与读回值不同但输出相同应跳过写盘");
+        }
+    });
+    run("浮点修正在输出精度内不可见时跳过写盘",[]{
+        Fixture f;write(f.file(),header()+"600000.SH,1d,2026-10-16 15:00:00,10,12,9,11,1.23457e+07,1000\n");const auto identity=file_identity(f.file());
+        Batch b;status(b.dates({1261016}),1,"日期");for(int type=1;type<=6;++type){float v[]={0,10,11,12,9,12345679.f,1000};status(b.field(type,{v[type]}),1,"字段");}
+        status(b.save(),1,"输出精度内相同");unchanged_file(f.file(),identity);
+    });
+    run("原文件禁止替换但内容未变化仍成功",[]{
+        Fixture f;write(f.file(),header()+row());const auto identity=file_identity(f.file());
+        FileHandle hold(CreateFileA(f.file().string().c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));
+        Batch b;b.complete();unchanged_file(f.file(),identity);
+    });
+    run("正负零输出不同仍保存且重复负零跳过写盘",[]{
+        Fixture f;write(f.file(),header()+"600000.SH,1d,2026-10-16 15:00:00,10,12,9,11,0,1000\n");const auto attempts=temp_file_calls.load();
+        for(int pass=0;pass<2;++pass){Batch b;status(b.dates({1261016}),1,"日期");const float v[]={0,10,11,12,9,-0.0f,1000};for(int type=1;type<=6;++type)status(b.field(type,{v[type]}),1,"有符号零字段");status(b.save(),1,"有符号零保存");}
+        contains(read(f.file()),",-0,1000\n");check(temp_file_calls==attempts+1,"输出字节不同必须保存，相同则跳过");
+    });
+    for(int changed=1;changed<=6;++changed)run("修正数值仍保存字段 "+std::to_string(changed),[=]{
+        Fixture f;write(f.file(),header()+row("1d","2026-10-15 15:00:00")+row());const auto original=read(f.file());const auto attempts=temp_file_calls.load();
+        Batch b;status(b.dates({1261016}),1,"日期");const float old[]={0,10,11,12,9,100,1000},updated[]={0,10.5f,10.5f,13,8,200,2000};
+        for(int type=1;type<=6;++type)status(b.field(type,{type==changed?updated[type]:old[type]}),1,"修正字段");status(b.save(),1,"修改后保存");
+        const auto csv=read(f.file());check(csv!=original&&lines(csv)==3,"修改必须保存且不增加重复行");contains(csv,row("1d","2026-10-15 15:00:00"));check(temp_file_calls==attempts+1,"修改应经过临时文件提交");
+        const auto identity=file_identity(f.file());Batch repeat;status(repeat.dates({1261016}),1,"重导日期");for(int type=1;type<=6;++type)status(repeat.field(type,{type==changed?updated[type]:old[type]}),1,"重复字段");status(repeat.save(),1,"修正后重复导出");unchanged_file(f.file(),identity);
+    });
+    const auto canonical=header()+row();
+    auto crlf=canonical;for(size_t at=0;(at=crlf.find('\n',at))!=std::string::npos;at+=2)crlf.insert(at,1,'\r');
+    const std::vector<std::string> legacy={"\xEF\xBB\xBF"+canonical,canonical+"\n",canonical+row(),crlf,header()+row("1d","2026-10-16 15:00:00+08"),header()+row("1d","2026-10-16 09:30:00"),canonical.substr(0,canonical.size()-1),header()+"600000.SH,1d,2026-10-16 15:00:00,10.0,12,9,11,100,1000\n"};
+    for(size_t i=0;i<legacy.size();++i)run("行情相同仍执行旧CSV规范化 "+std::to_string(i),[=]{
+        Fixture f;write(f.file(),legacy[i]);const auto attempts=temp_file_calls.load();Batch b;b.complete();check(read(f.file())==canonical,"旧格式必须继续规范化或去重");check(temp_file_calls==attempts+1,"规范化后的内容变化仍应保存");
+        const auto identity=file_identity(f.file());Batch repeat;repeat.complete();unchanged_file(f.file(),identity);
+    });
+    for(bool missing:{false,true})run(missing?"行情相同仍补齐旧周期标识列":"行情相同仍修正旧周期标识",[=]{
+        Fixture f;write(f.file("1w"),header(missing?"":"week_key")+row("1w","2026-10-16 15:00:00",missing?"":"2025W01"));Batch b(1,6);b.complete();check(read(f.file("1w"))==header("week_key")+row("1w","2026-10-16 15:00:00","2026W42"),"周期标识应按日期重算");
+    });
+    run("跳过写盘日志抛异常仍报告成功",[]{
+        Fixture f;write(f.file(),header()+row());const auto identity=file_identity(f.file());PerformanceLogFailure fault("数据未变化，跳过写盘：");Batch b;b.complete();unchanged_file(f.file(),identity);
+        std::lock_guard<std::mutex> lock(captured_log::mutex);check(captured_log::thrown==1,"应实际触发日志异常");
+    });
 
     run("15分钟同日合并更新重叠时间并保留历史",[]{
         Fixture f;Batch first(2,2);first.complete({1261016,1261016},{930,945});
@@ -577,7 +643,7 @@ void suite() {
     for(size_t i=0;i<corrupt.size();++i) run("旧文件损坏保护 " + std::to_string(i+1), [=] { Fixture f; write(f.file(),corrupt[i]); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); status(b.save(),-1,"坏文件保存"); check(read(f.file())==corrupt[i],"旧文件必须逐字节保留"); });
     for(bool nulInHeader : {false,true}) run(nulInHeader?"旧表头内含 NUL 必须拒绝":"旧数据行内含 NUL 必须拒绝",[=] { Fixture f; std::string original; if(nulInHeader) original=header().substr(0,header().size()-1)+std::string(1,'\0')+"被截断的坏表头\n"+row("1d","2026-10-15 15:00:00"); else original=header()+row("1d","2026-10-15 15:00:00").substr(0,row("1d","2026-10-15 15:00:00").size()-1)+std::string(1,'\0')+"被截断的坏内容\n"; write(f.file(),original); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); status(b.save(),-1,"含 NUL 的旧文件"); check(read(f.file())==original,"含 NUL 的旧文件必须逐字节保留"); });
     run("旧文件读失败不得覆盖", [] { Fixture f; auto original=header()+row(); write(f.file(),original); Series result; { FileHandle h(CreateFileA(f.file().string().c_str(),GENERIC_WRITE,FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr)); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); result=b.save(); } status(result,-1,"读失败"); check(read(f.file())==original,"读失败时原文件必须逐字节不变"); });
-    run("替换被占用不得截断旧文件", [] { Fixture f; auto original=header()+row(); write(f.file(),original); Series result; { FileHandle h(CreateFileA(f.file().string().c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr)); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); result=b.save(); } status(result,-1,"替换失败"); check(read(f.file())==original,"替换失败时原文件必须逐字节不变"); });
+    run("替换被占用不得截断旧文件", [] { Fixture f; auto original=header()+row(); write(f.file(),original); Series result; { FileHandle h(CreateFileA(f.file().string().c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr)); Batch b; status(b.dates({1261019}),1,"日期"); b.data(); result=b.save(); } status(result,-1,"替换失败"); check(read(f.file())==original,"替换失败时原文件必须逐字节不变"); });
     run("写锁冲突安全失败且原文件不变", [] { Fixture f; auto original=header()+row(); write(f.file(),original); Series result; { FileHandle lock(CreateFileA((f.file().string()+".lock").c_str(),GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_ALWAYS,FILE_FLAG_DELETE_ON_CLOSE,nullptr)); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); result=b.save(); } status(result,-1,"写锁冲突"); check(read(f.file())==original,"锁冲突时原文件必须逐字节不变"); });
     struct Snapshot { int code; const char *period; const char *keyName; const char *key; };
     for(auto p : std::vector<Snapshot>{{6,"1w","week_key","2026W42"},{7,"1mo","month_key","202610"},{11,"1y","year_key","2026"}}) run(std::string("较早快照不得回退 ")+p.period,[=] { Fixture f; auto original=header(p.keyName)+row(p.period,"2026-10-16 15:00:00",p.key); write(f.file(p.period),original); Batch b(1,p.code); status(b.dates({1261015}),1,"较早日期"); b.data(); status(b.save(),-1,"回退"); check(read(f.file(p.period))==original,"回退失败应保留旧文件"); });
@@ -895,30 +961,62 @@ void dll_pool_bulk(const fs::path &source,int workers,bool damaged=false) {
 void dll_lifecycle(const fs::path &source) {
     const auto dir=source.parent_path()/"module-lifecycle";fs::create_directories(dir);
     const auto dll=dir/"lifecycle_async.dll";copy_runtime(source,dll);
-    write(dir/"saveAsCVS.ini","[log]\nmode=file\nlevel=1\nfile=lifecycle.log\n[export]\ncsv_dir=csv\n");
-    HMODULE host=LoadLibraryA(dll.string().c_str());check(host!=nullptr,"生命周期DLL加载失败");
+    HMODULE host=nullptr;
     try {
-        dll_submit_one(host,600003,1261016);
-        check(FreeLibrary(host)!=FALSE,"释放宿主引用失败");host=nullptr;
-        check(GetModuleHandleA(dll.filename().string().c_str())==nullptr,"独立后台保存不能阻止接收DLL卸载");
-        // 必须先重新取得真实加载引用，才能调用排空；不使用已释放的裸函数指针。
-        host=LoadLibraryA(dll.string().c_str());check(host!=nullptr,"重新取得宿主模块引用失败");
-        status(call(dll_function(host,"Func7"),1,{0},{0},{0}),1,"重新加载后排空");
-        check(FreeLibrary(host)!=FALSE,"正常排空后卸载失败");host=nullptr;
-        check(GetModuleHandleA(dll.filename().string().c_str())==nullptr,"排空并释放宿主引用后DLL应彻底卸载");
         for(int iteration=0;iteration<3;++iteration) {
+            const auto log_name="lifecycle"+std::to_string(iteration)+".log";
+            write(dir/"saveAsCVS.ini","[log]\nmode=file\nlevel=1\nfile="+log_name+"\n[export]\ncsv_dir=csv\n");
             host=LoadLibraryA(dll.string().c_str());check(host!=nullptr,"重复加载失败");
+            auto register_functions=reinterpret_cast<BOOL (*)(PluginTCalcFuncInfo **)>(GetProcAddress(host,"RegisterTdxFunc"));check(register_functions!=nullptr,"缺少注册接口");
+            std::vector<DWORD> seen;
+            auto register_backend=[&]{
+                PluginTCalcFuncInfo *info=nullptr;check(register_functions(&info)&&info,"绑定时应自动启动后台");
+                DWORD pid=0;
+                for(const auto &file:fs::directory_iterator(dir)){
+                    const auto name=file.path().filename().string();if(name.size()<log_name.size()||name.compare(name.size()-log_name.size(),log_name.size(),log_name)!=0||name.find("_worker_")==std::string::npos)continue;
+                    const auto text=read(file.path());const auto at=text.find("独立后台启动 pid=");if(at==std::string::npos)continue;
+                    const auto value=static_cast<DWORD>(std::stoul(text.substr(at+std::string("独立后台启动 pid=").size())));
+                    HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,value);if(process){const bool alive=WaitForSingleObject(process,0)==WAIT_TIMEOUT;CloseHandle(process);if(alive&&std::find(seen.begin(),seen.end(),value)==seen.end())pid=value;}
+                }
+                check(pid!=0,"尚未调用采集接口，注册后就应存在独立后台");seen.push_back(pid);return pid;
+            };
+            const auto first_pid=register_backend();FileHandle first(OpenProcess(SYNCHRONIZE,FALSE,first_pid));
+            check(first.value!=nullptr,"无法观察首次后台");
+            status(call(dll_function(host,"Func4"),1,{600999},{1},{5}),1,"旧绑定保留未提交采集");
+            // 即使宿主没有真正卸载DLL，再次注册也必须结束旧后台并更换连接。
+            const auto second_pid=register_backend();FileHandle second(OpenProcess(SYNCHRONIZE,FALSE,second_pid));
+            check(second.value!=nullptr&&WaitForSingleObject(first.value,5000)==WAIT_OBJECT_0,"重新注册没有结束旧后台");
+            check(WaitForSingleObject(second.value,0)==WAIT_TIMEOUT,"新后台尚未运行");
+            status(call(dll_function(host,"Func7"),1,{0},{0},{0}),1,"旧绑定的未提交采集不能污染新后台排空");
+            const auto saving_pid=register_backend();FileHandle saving(OpenProcess(SYNCHRONIZE,FALSE,saving_pid));check(saving.value!=nullptr,"无法观察保存后台");
             dll_submit_one(host,600003,1261019+iteration);
             status(call(dll_function(host,"Func7"),1,{0},{0},{0}),1,"重复加载后排空");
+            check(WaitForSingleObject(saving.value,5000)==WAIT_OBJECT_0,"主动排空没有结束新后台");
+            // 排空后重新绑定，验证未提交任务时卸载也能关闭后台。
+            const auto third_pid=register_backend();FileHandle third(OpenProcess(SYNCHRONIZE,FALSE,third_pid));check(third.value!=nullptr,"无法观察再次绑定后台");
             check(FreeLibrary(host)!=FALSE,"重复加载后卸载失败");host=nullptr;
+            check(WaitForSingleObject(third.value,5000)==WAIT_OBJECT_0,"DLL已卸载，后台仍未退出");
             check(GetModuleHandleA(dll.filename().string().c_str())==nullptr,"重复加载排空后不应残留模块引用");
         }
-        check(lines(read(dir/"csv"/"600003.SH.1d.csv"))==5,"各次生命周期的已提交数据必须完整保留");
+        check(lines(read(dir/"csv"/"600003.SH.1d.csv"))==4,"各次已排空生命周期的数据必须完整保留");
     } catch(...) {
         if(!host&&GetModuleHandleA(dll.filename().string().c_str()))host=LoadLibraryA(dll.string().c_str());
         if(host){const auto finish=reinterpret_cast<Function>(GetProcAddress(host,"Func7"));if(finish)call(finish,1,{0},{0},{0});FreeLibrary(host);}
         throw;
     }
+}
+void dll_binding_failure(const fs::path &source) {
+    const auto dir=source.parent_path()/"binding-failure";fs::create_directories(dir);
+    const auto dll=dir/"binding_failure.dll";copy_runtime(source,dll);
+    write(dir/"saveAsCVS.ini","[log]\nmode=file\nlevel=1\nfile=binding.log\n[async]\nworker_path=missing_worker.exe\n");
+    HMODULE host=LoadLibraryA(dll.string().c_str());check(host!=nullptr,"缺失后台仍应能装载DLL并记录错误");
+    try {
+        auto fn=reinterpret_cast<BOOL (*)(PluginTCalcFuncInfo **)>(GetProcAddress(host,"RegisterTdxFunc"));check(fn!=nullptr,"缺少注册接口");
+        PluginTCalcFuncInfo *info=nullptr;check(!fn(&info)&&info==nullptr,"后台启动失败应拒绝绑定，不返回可用函数表");
+        FreeLibrary(host);host=nullptr;std::string text;
+        for(const auto &file:fs::directory_iterator(dir))if(file.path().extension()==".log")text+=read(file.path());
+        contains(text,"DLL绑定时启动后台失败");contains(text,"missing_worker.exe");
+    }catch(...){if(host)FreeLibrary(host);throw;}
 }
 int dll_exit_child(const fs::path &dll) {
     try {
@@ -954,7 +1052,8 @@ int main(int argc, char **argv) {
         test::run("实际 Win32 发布 DLL 注册保存及 INFO 性能日志",[&]{test::dll_smoke(argv[2]);});
         test::run("已有工作线程动态加载 DLL 后相互隔离",[&]{test::dll_existing_threads_smoke(argv[2]);});
         test::run("实际日志关闭 INFO 后保持正常保存",[&]{test::dll_smoke(argv[2],2);});
-        test::run("接收DLL卸载后独立后台保留任务及重新绑定排空",[&]{test::dll_lifecycle(argv[2]);});
+        test::run("DLL绑定自动启动、重新注册重启及卸载立即结束后台",[&]{test::dll_lifecycle(argv[2]);});
+        test::run("绑定时后台缺失明确失败并保留启动错误日志",[&]{test::dll_binding_failure(argv[2]);});
         test::run("独立进程未排空退出不会锁死",[&]{test::dll_process_exit(argv[2]);});
         for(int workers:{2,8,32,128})test::run("实际DLL按"+std::to_string(workers)+"线程混合保存12个文件96个任务",[&]{test::dll_pool_bulk(argv[2],workers);});
         test::run("实际DLL并行保存时损坏文件保持且其他文件完整",[&]{test::dll_pool_bulk(argv[2],8,true);});

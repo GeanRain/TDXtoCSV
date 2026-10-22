@@ -208,7 +208,7 @@ class Server
         }
     }
 public:
-    Server(DWORD pid,std::uint64_t created,const std::wstring &directory):
+    Server(DWORD pid,std::uint64_t created,const std::wstring &directory,std::uint64_t lifetime):
         parent(OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid)),parent_pid(pid),parent_created(created),
         epoch(creation_time(GetCurrentProcess())^(std::uint64_t(GetCurrentProcessId())<<32))
     {
@@ -220,7 +220,7 @@ public:
         const auto workers=number(wide(ini.getString("async","worker_threads","8")));
         if(!limits.capacity||limits.capacity>INT_MAX||!megabytes||megabytes>INT_MAX||!workers||workers>kMaxWorkers)throw std::runtime_error("后台队列参数无效");
         limits.bytes=megabytes*1024*1024;limits.workers=static_cast<std::size_t>(workers);
-        const auto base=pipe_base(pid,created,directory);auto cp=create_pipe(base+L".control"),dp=create_pipe(base+L".data");
+        const auto base=pipe_base(pid,created,directory,lifetime);auto cp=create_pipe(base+L".control"),dp=create_pipe(base+L".data");
         control=Channel(std::exchange(cp.value,nullptr));data=Channel(std::exchange(dp.value,nullptr));writer.start(limits);
     }
     int run()
@@ -244,14 +244,15 @@ int WINAPI wWinMain(HINSTANCE,HINSTANCE,PWSTR,int)
     try{
         int count=0;auto arguments=CommandLineToArgvW(GetCommandLineW(),&count);if(!arguments)win_error("解析后台启动参数");
         std::vector<std::wstring> args;for(int i=0;i<count;++i)args.emplace_back(arguments[i]);LocalFree(arguments);
-        if(args.size()!=5||args[1]!=L"--parent")return 2;
+        if((args.size()!=5&&args.size()!=6)||args[1]!=L"--parent")return 2;
         const auto pid=number(args[2]),created=number(args[3]);if(!pid||pid>MAXDWORD)return 2;
+        const auto generation=args.size()==6?number(args[5]):0;
         ParentLifetime lifetime(static_cast<DWORD>(pid),created);
         Logger::initialize(narrow(args[4]),"worker_"+std::to_string(GetCurrentProcessId())+"_");logging=true;
-        const auto base=pipe_base(static_cast<DWORD>(pid),created,args[4]);Handle instance(CreateMutexW(nullptr,FALSE,(L"Local\\"+base.substr(9)).c_str()));
+        const auto base=pipe_base(static_cast<DWORD>(pid),created,args[4],generation);Handle instance(CreateMutexW(nullptr,FALSE,(L"Local\\"+base.substr(9)).c_str()));
         if(!instance)win_error("创建后台实例锁");if(GetLastError()==ERROR_ALREADY_EXISTS){Logger::shutdown();return 0;}
         LOG_INFO("独立后台启动 pid=%lu parent=%llu architecture=x86 protocol=%u",GetCurrentProcessId(),pid,version);
-        Server server(static_cast<DWORD>(pid),created,args[4]);const auto result=server.run();Logger::shutdown();return result;
+        Server server(static_cast<DWORD>(pid),created,args[4],generation);const auto result=server.run();Logger::shutdown();return result;
     }catch(const std::exception &error){if(logging)try{LOG_ERROR("后台致命错误：%s",error.what());}catch(...){};}
     catch(...){if(logging)try{LOG_ERROR("%s","后台致命异常");}catch(...){};}
     if(logging)Logger::shutdown();return 3;

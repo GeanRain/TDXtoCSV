@@ -6,7 +6,7 @@ namespace tdx_export
 class ProcessWriter
 {
 public:
-    explicit ProcessWriter(const std::string &directory);
+    explicit ProcessWriter(const std::string &directory,HANDLE lifetime_job=nullptr,std::uint64_t lifetime=0);
     ~ProcessWriter();
     void start(AsyncLimits limits={},const std::string &csv_dir={},const std::string &worker_path={});
     std::uint64_t reserve(std::uint64_t bytes);
