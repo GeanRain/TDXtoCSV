@@ -12,11 +12,11 @@ std::string read(const fs::path &file){std::ifstream in(file,std::ios::binary);r
 int child(const fs::path &dll,bool unload){
     const auto module=LoadLibraryW(dll.c_str());check(module!=nullptr,"无法加载被测DLL");
     auto fn=[&](int id){auto f=reinterpret_cast<Fn>(GetProcAddress(module,("Func"+std::to_string(id)).c_str()));check(f!=nullptr,"缺少导出函数");return f;};
-    float out[2]{},dates[]={1261019,1261020},data[2]{},market=1,period=5,zero=0,one=1,command=3;
-    auto call=[&](int id,float *a,float *b,float *c){fn(id)(2,out,a,b,c);check(out[0]==1&&out[1]==1,"宿主接口调用失败");};
+    float out[2]{},dates[]={1261019,1261020},first[2]{},second[2]{},market=1,period=5,zero=0,one=1,command=3;
+    auto call=[&](int id,float *a,float *b,float *c){out[0]=out[1]=-999;fn(id)(2,out,a,b,c);const float expected=id==3?-999.f:1.f;check(out[0]==expected&&out[1]==expected,"宿主接口输出不符合约定");};
     for(float code:{600031.f,600032.f}){
         call(4,&code,&market,&period);call(5,&one,&zero,&zero);call(2,dates,nullptr,&one);
-        const float values[]={10,11,12,9,100,1000};for(int i=0;i<6;++i){data[0]=data[1]=values[i];float type=static_cast<float>(i+1);call(3,&type,data,&one);}call(1,&command,&one,&zero);
+        const float values[]={10,11,12,9,100,1000};for(int i=0;i<3;++i){first[0]=first[1]=values[i*2];second[0]=second[1]=values[i*2+1];float type=static_cast<float>(i+1);call(3,&type,first,second);}call(1,&command,&one,&zero);
     }
     write(dll.parent_path()/"accepted.txt","accepted");char name[128]{};
     check(GetEnvironmentVariableA("TDX_TEST_HOST_EXIT",name,sizeof(name))>0,"缺少退出事件");Handle exit(OpenEventA(SYNCHRONIZE,FALSE,name));check(bool(exit),"退出事件不存在");WaitForSingleObject(exit.value,INFINITE);

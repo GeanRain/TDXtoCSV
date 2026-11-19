@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <locale>
+#include <limits>
 #include <map>
 #include <new>
 #include <sstream>
@@ -19,6 +20,7 @@ namespace tdx_export
 {
 constexpr LONGLONG kMaxCsvBytes = 512LL * 1024 * 1024;
 const char *kHeader = "symbol,period,ts,open,high,low,close,volume,amount";
+constexpr std::string_view kEventColumns = ",ExRights,ExDividend";
 double elapsed_ms(ExportClock::time_point begin)
 {
     return std::chrono::duration<double, std::milli>(ExportClock::now() - begin).count();
@@ -32,6 +34,8 @@ struct CsvRow
     std::string key;
     int date = 0;
     float values[6]{}; // CSV 顺序：开、高、低、收、量、额
+    float events[2]{};
+    bool has_events = false;
 };
 
 struct FileHandle
@@ -79,6 +83,7 @@ void log_export_timing(const ExportJob &s, float result)
     if (s.started == ExportClock::time_point{} || s.count <= 0) return;
     double receive = 0;
     for (int i = 0; i < 9; ++i) receive += s.call_ms[i];
+    receive += s.call_ms[10];
     const double save = s.save_call_ms, total = receive + s.call_ms[9] + save;
     const double wall = s.frontend_elapsed_ms + elapsed_ms(s.started);
     const char *status = result == 1.0f ? "ok" : "failed";
@@ -90,12 +95,12 @@ void log_export_timing(const ExportJob &s, float result)
                  "receive_ms=%.3f save_ms=%.3f total_ms=%.3f save_pct=%.3f "
                  "submit_ms=%.3f queue_wait_ms=%.3f "
                  "wall_ms=%.3f start_ms=%.3f meta_ms=%.3f date_ms=%.3f "
-                 "open_ms=%.3f close_ms=%.3f high_ms=%.3f low_ms=%.3f volume_ms=%.3f amount_ms=%.3f",
+                 "open_close_ms=%.3f high_low_ms=%.3f volume_amount_ms=%.3f events_ms=%.3f",
                  s.symbol.c_str(), period, s.caller_thread, s.id, s.count, status,
                  receive, save, total, total > 0 ? save * 100 / total : 0,
                  s.call_ms[9], s.queue_wait_ms, wall,
-                 s.call_ms[0], s.call_ms[1], s.call_ms[2], s.call_ms[3], s.call_ms[4],
-                 s.call_ms[5], s.call_ms[6], s.call_ms[7], s.call_ms[8]);
+                 s.call_ms[0], s.call_ms[1], s.call_ms[2], s.call_ms[3]+s.call_ms[4],
+                 s.call_ms[5]+s.call_ms[6], s.call_ms[7]+s.call_ms[8], s.call_ms[10]);
     }
     catch (...) {} // 计时日志失败不能改变已经提交的保存结果。
     try
@@ -310,8 +315,8 @@ bool valid_values(const CsvRow &row)
 
 bool parse_csv_row(const std::string &line, size_t column_count, CsvRow &row, const ExportJob &job)
 {
-    if(column_count<9||column_count>10)return false;
-    std::array<std::string_view,10> columns;const std::string_view view(line);std::size_t start=0,count=0;
+    if(column_count<9||column_count>12)return false;
+    std::array<std::string_view,12> columns;const std::string_view view(line);std::size_t start=0,count=0;
     for(;;){
         if(count==column_count)return false;
         const auto end=view.find(',',start);
@@ -325,6 +330,15 @@ bool parse_csv_row(const std::string &line, size_t column_count, CsvRow &row, co
         return false;
     for (int i = 0; i < 6; ++i)
         if (!parse_number(columns[i + 3], row.values[i])) return false;
+    row.has_events = false;
+    if (column_count >= 11)
+    {
+        const auto at = column_count - 2;
+        row.has_events = !columns[at].empty() || !columns[at + 1].empty();
+        if (row.has_events && (!parse_number(columns[at], row.events[0]) ||
+                               !parse_number(columns[at + 1], row.events[1]) ||
+                               row.events[0] < 0 || row.events[1] < 0)) return false;
+    }
     row.key = row_key(row.period, row.date, row.ts);
     return valid_values(row);
 }
@@ -341,7 +355,7 @@ bool read_line(std::ifstream &input, std::string &line)
     return true;
 }
 
-bool load_existing(const std::string &path, std::map<std::string, CsvRow> &rows, const ExportJob &job)
+bool load_existing(const std::string &path, std::map<std::string, CsvRow> &rows, const ExportJob &job, bool &has_events)
 {
     std::ifstream input;
     input.exceptions(std::ios::badbit);
@@ -350,6 +364,9 @@ bool load_existing(const std::string &path, std::map<std::string, CsvRow> &rows,
     std::string header;
     if (!read_line(input, header)) return false;
     if (header.compare(0, 3, "\xEF\xBB\xBF") == 0) header.erase(0, 3);
+    has_events = header.size() >= kEventColumns.size() &&
+        std::string_view(header).substr(header.size() - kEventColumns.size()) == kEventColumns;
+    if (has_events) header.resize(header.size() - kEventColumns.size());
     std::string extra = key_column(job.period);
     size_t columns = 9;
     if (header != kHeader)
@@ -357,6 +374,7 @@ bool load_existing(const std::string &path, std::map<std::string, CsvRow> &rows,
         if (extra.empty() || header != std::string(kHeader) + "," + extra) return false;
         columns = 10;
     }
+    if (has_events) columns += 2;
     std::string line;
     std::string previous;
     while (read_line(input, line))
@@ -368,7 +386,9 @@ bool load_existing(const std::string &path, std::map<std::string, CsvRow> &rows,
         previous = row.ts;
         auto old = rows.find(row.key);
         if (old != rows.end() && row.ts == old->second.ts &&
-            !std::equal(row.values, row.values + 6, old->second.values))
+            (!std::equal(row.values, row.values + 6, old->second.values) ||
+             row.has_events != old->second.has_events ||
+             (row.has_events && !std::equal(row.events, row.events + 2, old->second.events))))
             return false;
         // 旧文件可能有同周期多个快照，迁移时保留日期较晚者。
         if (old == rows.end() || row.ts >= old->second.ts)
@@ -392,6 +412,12 @@ bool write_csv(ExportJob &s)
     for (const auto &values : s.series)
         if (values.size() != static_cast<size_t>(s.count))
             return save_reject("后台数值数组长度不一致");
+    for (const auto &values : s.events)
+        if (s.has_events ? values.size() != static_cast<size_t>(s.count) : !values.empty())
+            return save_reject("后台除权除息数组缺失或长度不一致");
+    std::vector<float> event_results[2];
+    if (s.has_events && !s.minute)
+        for (auto &values : event_results) values.resize(s.count, 0.0f);
     std::map<std::string, CsvRow> incoming;
     int previous_date = 0, previous_time = 0;
     for (int i = 0; i < s.count; ++i)
@@ -418,8 +444,20 @@ bool write_csv(ExportJob &s)
         row.date = date;
         const int order[] = {0,2,3,1,4,5};
         for (int v = 0; v < 6; ++v) row.values[v] = s.series[order[v]][i];
+        row.has_events = s.has_events && !s.minute;
+        if (row.has_events) for (int v = 0; v < 2; ++v)
+        {
+            // 原始数组保持不变，重试时仍与原始前值比较；首项和未变化位置保留零。
+            if (i > 0 && s.events[v][i] != s.events[v][i - 1])
+#ifndef TDX_LEGACY_API_BENCHMARK
+                event_results[v][i] = s.events[v][i] * 100.0f;
+#else
+                event_results[v][i] = s.events[v][i];
+#endif
+            row.events[v] = event_results[v][i];
+        }
         if (!valid_values(row))
-            return save_reject("数值无法安全格式化、存在负量额或价格关系矛盾");
+            return save_reject("行情数值非有限、存在负量额或价格关系矛盾");
         row.ts = format_ts(date, time);
         row.key = row_key(row.period, row.date, row.ts);
         incoming[row.key] = row;
@@ -434,24 +472,33 @@ bool write_csv(ExportJob &s)
     if (lock.value == INVALID_HANDLE_VALUE)
         return save_reject("目标正在导出，或无法创建写锁，请稍后重跑");
     std::map<std::string, CsvRow> rows;
+    bool write_events = false;
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
     const bool exists = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &attributes) != FALSE;
     if (exists)
     {
         if ((attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
             attributes.nFileSizeHigh || attributes.nFileSizeLow > kMaxCsvBytes ||
-            !load_existing(path, rows, s))
+            !load_existing(path, rows, s, write_events))
             return save_reject("旧 CSV 无法完整读取或内容不合法，已停止覆盖");
     }
     else if (GetLastError() != ERROR_FILE_NOT_FOUND)
         return save_reject("无法检查旧 CSV，已停止覆盖");
+    write_events = write_events || s.has_events || s.minute;
     timing.next();
     for (const auto &entry : incoming)
     {
         auto old = rows.find(entry.first);
         if (old != rows.end() && entry.second.ts < old->second.ts)
             return save_reject("输入快照早于同周期已保存记录，已停止回退覆盖");
-        rows[entry.first] = entry.second;
+        CsvRow merged = entry.second;
+        // 旧公式未传事件时，仅同一时间戳沿用已知值，不能移到其他日期。
+        if (!merged.has_events && old != rows.end() && merged.ts == old->second.ts)
+        {
+            merged.has_events = old->second.has_events;
+            std::copy(old->second.events, old->second.events + 2, merged.events);
+        }
+        rows[entry.first] = std::move(merged);
     }
     std::vector<const CsvRow *> ordered;
     ordered.reserve(rows.size());
@@ -461,6 +508,7 @@ bool write_csv(ExportJob &s)
     const std::string extra = key_column(s.period);
     std::string header = kHeader;
     if (!extra.empty()) { header.push_back(','); header.append(extra); }
+    if (write_events) header.append(kEventColumns);
     header.push_back('\n');
     std::string line;
     line.reserve(192);
@@ -474,6 +522,16 @@ bool write_csv(ExportJob &s)
             line.push_back(',');line.append(text,static_cast<std::size_t>(formatted.ptr-text));
         }
         if(!extra.empty()){line.push_back(',');line.append(row->key);}
+        if (write_events) for (float value : row->events)
+        {
+            line.push_back(',');
+            if (s.minute || !row->has_events) continue; // 分钟不提供事件；旧历史未采集，不伪造为零。
+            // 最大float用double的往返精度，避免九位文本舍入后略超旧解析上限。
+            const int precision=value==FLT_MAX?std::numeric_limits<double>::max_digits10:std::numeric_limits<float>::max_digits10;
+            char text[64];const auto formatted=std::to_chars(text,text+sizeof(text),static_cast<double>(value),std::chars_format::general,precision);
+            if(formatted.ec!=std::errc{})return save_reject("事件值格式化缓冲不足，已保留原文件");
+            line.append(text,static_cast<std::size_t>(formatted.ptr-text));
+        }
         line.push_back('\n');
         return true;
     };

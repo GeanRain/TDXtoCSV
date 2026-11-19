@@ -42,6 +42,11 @@ int main(){
             if(!valid_date(year*10000+month*100+(++day))){day=1;if(++month>12){month=1;++year;}}
         }
         check(write_csv(job),"随机极值保存失败");std::ifstream input(directory/"600000.SH.1d.csv",std::ios::binary);const std::string actual{std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>()};check(actual==expected.str(),"六位有效数字输出与旧流格式不一致");
-        std::cout<<"通过 一万行随机浮点及极值输出逐字节一致，含科学计数法和负零\n";return 0;
+        std::cout<<"通过 一万行随机浮点及极值输出逐字节一致，含科学计数法和负零\n";input.close();
+        job.has_events=true;for(int i=0;i<job.count;++i){const float raw=std::fabs(job.series[0][i])/128.0f;job.events[0].push_back(raw);job.events[1].push_back(i==1?-0.0f:raw);}
+        check(write_csv(job),"随机事件值保存失败");std::ifstream events(directory/"600000.SH.1d.csv",std::ios::binary);std::string line;std::getline(events,line);check(line==std::string(kHeader)+",ExRights,ExDividend","事件表头错误");
+        for(int i=0;i<job.count;++i){check(bool(std::getline(events,line)),"事件行丢失");CsvRow parsed;check(parse_csv_row(line,11,parsed,job),"随机或极值事件无法再次读取");check(parsed.has_events,"事件结果不能为空");for(int field=0;field<2;++field){const float expected_value=i&&job.events[field][i]!=job.events[field][i-1]?job.events[field][i]*100.0f:0.0f;check(std::memcmp(parsed.events+field,&expected_value,sizeof(float))==0,"后台乘100后的变化值往返丢失精度或零值位置错误");}}
+        events.close();const auto modified=std::filesystem::last_write_time(directory/"600000.SH.1d.csv");check(write_csv(job),"随机事件重导失败");check(std::filesystem::last_write_time(directory/"600000.SH.1d.csv")==modified,"相同随机事件不能重写CSV");
+        std::cout<<"通过 一万行事件变化值无损往返及相同内容跳过写盘，含首项零、最大值、极小值和负零\n";return 0;
     }catch(const std::exception &error){std::cerr<<error.what()<<'\n';return 1;}
 }

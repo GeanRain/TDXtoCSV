@@ -219,7 +219,7 @@ void ProcessWriter::submit(std::uint64_t id,ExportJob &&job)
     const auto begin=ExportClock::now();double transfer_ms=0,confirm_ms=0;std::uint64_t payload_bytes=0;
     auto &p=*impl_;std::lock_guard<std::mutex> lock(p.mutex);Buffer meta;encode_job(meta,job);
     auto checksum=crc32(0,meta.data.data(),meta.data.size());
-    for(unsigned field=0;field<8;++field){auto &values=array(job,field);payload_bytes+=values.size()*sizeof(float);checksum=crc32(checksum,values.data(),values.size()*sizeof(float));}
+    for(unsigned field=0;field<array_count(job);++field){auto &values=array(job,field);payload_bytes+=values.size()*sizeof(float);checksum=crc32(checksum,values.data(),values.size()*sizeof(float));}
     const auto crc_ms=std::chrono::duration<double,std::milli>(ExportClock::now()-begin).count();
     unsigned reconnects=0;
     for(;;){
@@ -230,7 +230,7 @@ void ProcessWriter::submit(std::uint64_t id,ExportJob &&job)
                 p.open_data();Packet begin;begin.command=Command::Begin;begin.epoch=p.epoch;begin.id=id;begin.body=meta;
                 p.data.send(begin,p.stop.value,p.process.value);auto ready=p.data.receive(control_limit,p.stop.value,p.process.value,0);
                 if(p.result(ready,Command::Begin,id)!=Result::Ready)throw Rejected("后台尚未准备接收数据");
-                for(unsigned field=0;field<8;++field){auto &values=array(job,field);std::size_t offset=0;
+                for(unsigned field=0;field<array_count(job);++field){auto &values=array(job,field);std::size_t offset=0;
                     while(offset<values.size()){
                         p.input_ready();const auto count=std::min(values.size()-offset,(data_limit-8)/sizeof(float));
                         Packet packet;packet.command=Command::Data;packet.epoch=p.epoch;packet.id=id;packet.body.u32(field);packet.body.u32(static_cast<std::uint32_t>(offset));

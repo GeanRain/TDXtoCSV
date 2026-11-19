@@ -101,6 +101,7 @@ void Logger::log(const char *level, const char *format, ...) {
 namespace test {
 namespace fs = std::filesystem;
 using Series = std::vector<float>;
+using Fields = std::array<Series,6>;
 using Function = void (*)(int, float *, float *, float *, float *);
 fs::path root;
 int passed = 0, failed = 0, serial = 0;
@@ -109,6 +110,8 @@ void check(bool condition, const std::string &message) {
     if (!condition) throw std::runtime_error(message);
 }
 Series values(int n, float value) { return Series(n, value); }
+Fields default_fields(int n) {return {values(n,10),values(n,11),values(n,12),values(n,9),values(n,100),values(n,1000)};}
+Fields field_values(int n,const float (&numbers)[7]) {Fields result;for(int i=0;i<6;++i)result[i]=values(n,numbers[i+1]);return result;}
 Series call(Function fn, int n, Series a, Series b, Series c) {
     Series out(n > 0 ? n : 1, -999);
     fn(n, out.data(), a.empty() ? nullptr : a.data(), b.empty() ? nullptr : b.data(), c.empty() ? nullptr : c.data());
@@ -116,6 +119,12 @@ Series call(Function fn, int n, Series a, Series b, Series c) {
 }
 void status(const Series &result, float expected, const std::string &stage) {
     for (float value : result) check(value == expected, stage + " 返回值应为 " + std::to_string(expected) + "，实际 " + std::to_string(value));
+}
+void native_pair(Function fn,int n,int type,const Series &first,const Series &second) {
+    status(call(fn,n,values(n,static_cast<float>(type)),first,second),-999,"成对接口不回填输出");
+}
+void native_fields(Function fn,int n,const Fields &fields) {
+    for(int type=1;type<=3;++type)native_pair(fn,n,type,fields[(type-1)*2],fields[(type-1)*2+1]);
 }
 std::string read(const fs::path &path) {
     std::ifstream in(path, std::ios::binary);
@@ -162,17 +171,19 @@ struct Batch {
         return result;
     }
     Series dates(const Series &dates, const Series &times = {}) { previous = call(Func2, n, dates, times, dependency(n)); return previous; }
-    Series field(int type, const Series &data, int count = -1) {
+    Series pair(int type, const Series &first, const Series &second, int count = -1) {
         if (count < 0) count = n;
-        previous = call(Func3, count, values(count, static_cast<float>(type)), data, dependency(count));
-        return previous;
+        const auto out=call(Func3,count,values(count,static_cast<float>(type)),first,second);
+        status(out,-999,"成对接口不回填返回数组");
+        // 测试诊断取内部采集状态，不能把未回填的pOut作为接收结果或依赖。
+        return values(count,state().failed?-1.f:1.f);
     }
-    void data() {
-        for (int type = 1; type <= 6; ++type) {
-            float v[] = {0, 10, 11, 12, 9, 100, 1000};
-            status(field(type, values(n, v[type])), 1, "传入字段 " + std::to_string(type));
-        }
+    Series events(const Series &rights,const Series &dividend) {return pair(7,rights,dividend);}
+    void data(const Fields &fields) {
+        for(int type=1;type<=3;++type)status(pair(type,fields[(type-1)*2],fields[(type-1)*2+1]),1,"成对接收行情");
     }
+    void data() {data(default_fields(n));}
+    void data(const float (&numbers)[7]) {data(field_values(n,numbers));}
     Series save() {
         previous = call(Func1, n, values(n, 3), dependency(n), values(n, 0));
         if(previous[0]==1) previous=call(Func7,n,values(n,0),values(n,0),values(n,0));
@@ -256,7 +267,7 @@ void check_reports(const std::vector<captured_log::Entry> &entries, const std::s
     check(wall + 0.25 >= combined, "wall_ms 应包含接收与保存以及宿主间隔");
     check(std::abs(percentage * combined / 100 - save) <= 0.25, "save_pct 的分母应是 total_ms");
     double received = 0;
-    for (const char *key : {"start_ms", "meta_ms", "date_ms", "open_ms", "close_ms", "high_ms", "low_ms", "volume_ms", "amount_ms"})
+    for (const char *key : {"start_ms", "meta_ms", "date_ms", "open_close_ms", "high_low_ms", "volume_amount_ms", "events_ms"})
         received += metric_number(total, key);
     check(std::abs(received - receive) <= 0.25, "receive_ms 应包含开始、设置、日期及六组数组");
     double segmented = 0;
@@ -277,6 +288,8 @@ std::string header(const std::string &key = "") { return "symbol,period,ts,open,
 std::string row(const std::string &period = "1d", const std::string &ts = "2026-10-16 15:00:00", const std::string &key = "") {
     return "600000.SH," + period + "," + ts + ",10,12,9,11,100,1000" + (key.empty() ? "" : "," + key) + "\n";
 }
+std::string event_header(const std::string &key="") {auto text=header(key);text.pop_back();return text+",ExRights,ExDividend\n";}
+std::string event_row(const std::string &rights,const std::string &dividend,const std::string &period="1d",const std::string &ts="2026-10-16 15:00:00",const std::string &key="") {auto text=row(period,ts,key);text.pop_back();return text+","+rights+","+dividend+"\n";}
 bool high_address_usage(std::uint64_t &total,std::uint64_t &available,std::uint64_t &commit) {
     total=100000;available=5000;commit=100000;return true; // 地址已占95%，系统提交额度仍充足。
 }
@@ -389,14 +402,14 @@ void suite() {
     run("后台逐列拒绝非法数值 "+std::to_string(field)+" "+std::to_string(invalid),[=]{
         Fixture f;const auto original=header()+row("1d","2026-10-15 15:00:00");write(f.file(),original);
         Batch b;status(b.dates({1261016}),1,"原始日期已接收");
-        for(int type=1;type<=6;++type){float v[]={0,10,11,12,9,100,1000};status(b.field(type,{type==field?invalid:v[type]}),1,"原始数值已接收");}
+        auto fields=default_fields(b.n);fields[field-1]=values(b.n,invalid);b.data(fields);
         status(b.save(),-1,"后台不得写入非法数值");check(read(f.file())==original,"非法数值不得改变原文件");
         status(call(Func6,1,{3},{0},{0}),1,"非法数值须保留失败");
     });
     run("无效任务不覆盖历史且后续其他股票继续保存",[]{
         Fixture f;const auto original=header()+row("1d","2026-10-15 15:00:00");write(f.file(),original);
         Batch bad;status(bad.dates({1261016}),1,"日期");
-        for(int type=1;type<=6;++type){float v[]={0,10,11,12,9,100,1000};status(bad.field(type,{type==5?-1.f:v[type]}),1,"原始量额");}
+        auto fields=default_fields(bad.n);fields[4]=values(bad.n,-1);bad.data(fields);
         status(call(Func1,1,{3},bad.previous,{0}),1,"非法内容仍安全移交后台");
         Batch good(1,5,0,600001);status(good.dates({1261019}),1,"后续日期");good.data();status(call(Func1,1,{3},good.previous,{0}),1,"后续正常提交");
         status(call(Func7,1,{0},{0},{0}),-1,"整体排空应报告前一个任务失败");
@@ -423,10 +436,10 @@ void suite() {
         // 直接传入随后改写的同一缓冲，避免按值调用助手的副本掩盖所有权错误。
         Func2(2,out.data(),dates.data(),times.data(),b.previous.data());b.previous=out;status(out,1,"复制原始日期时间");
         std::fill(dates.begin(),dates.end(),std::numeric_limits<float>::quiet_NaN());std::fill(times.begin(),times.end(),-1.f);
-        for(int type=1;type<=6;++type){
-            float value[]={0,10,11,12,9,100,1000};Series data(2,value[type]),types(2,static_cast<float>(type));
-            Func3(2,out.data(),types.data(),data.data(),b.previous.data());b.previous=out;status(out,1,"复制数值");
-            std::fill(data.begin(),data.end(),std::numeric_limits<float>::quiet_NaN());
+        for(int type=1;type<=3;++type){
+            const float value[]={0,10,11,12,9,100,1000};Series first(2,value[type*2-1]),second(2,value[type*2]),types(2,static_cast<float>(type));
+            std::fill(out.begin(),out.end(),-999);Func3(2,out.data(),types.data(),first.data(),second.data());status(out,-999,"复制后不回填输出");
+            std::fill(first.begin(),first.end(),std::numeric_limits<float>::quiet_NaN());std::fill(second.begin(),second.end(),std::numeric_limits<float>::quiet_NaN());
         }
         status(b.save(),1,"调用方改写不能污染任务");const auto csv=read(f.file("15m"));check(lines(csv)==3,"两根数据均须保存");
         contains(csv,"2026-10-16 09:30:00");contains(csv,"2026-10-19 09:45:00");
@@ -478,6 +491,27 @@ void suite() {
         for(int i=0;i<=workers;++i)check(lines(read(f.file("1d",std::to_string(600000+i)+".SH")))==2,"每个目标必须完整保存");
         check(fs::exists(f.dir/"csv"/("_bg_0-1000_0-"+std::to_string(workers))),"状态文件须显示实际线程上限及最终归零");
     });
+    run("正式Func3成对接收开收且不回填返回数组",[]{
+        Fixture f;Batch b;status(b.dates({1261016}),1,"日期");
+        const auto out=call(Func3,1,{1},{10},{11});status(out,-999,"Func3没有返回数组");
+        check(state().series[0]==Series{10}&&state().series[1]==Series{11},"两个参数都必须作为数据复制，不读取前一步状态");
+    });
+    run("正式后台将原始SPLIT变化值乘100后保存",[]{
+        Fixture f;ExportJob item;item.count=2;item.native_period=5;item.symbol="600000.SH";item.period="1d";item.csv_dir=(f.dir/"csv").string();item.dates={1261015,1261016};
+        const float fields[]={10,11,12,9,100,1000};for(int i=0;i<6;++i)item.series[i].assign(2,fields[i]);item.has_events=true;item.events[0]={0,.5f};item.events[1]={0,.25f};
+        check(write_csv(item),"保存原始SPLIT");check(read(f.file())==event_header()+event_row("0","0","1d","2026-10-15 15:00:00")+event_row("50","25"),"乘100必须由独立后台保存核心完成");
+    });
+    for(int type:{1,2,3})for(bool missing_first:{false,true})run("正式成对接口缺参保护 "+std::to_string(type)+" "+std::to_string(missing_first),[=]{
+        Fixture f;const auto original=header()+row();write(f.file(),original);Batch b(2);status(b.dates({1261015,1261016}),1,"日期");const auto fields=default_fields(2);
+        for(int before=1;before<type;++before)status(b.pair(before,fields[(before-1)*2],fields[(before-1)*2+1]),1,"前序成对数据");
+        status(b.pair(type,missing_first?Series{}:fields[(type-1)*2],missing_first?fields[(type-1)*2+1]:Series{}),-1,"缺少成对输入");
+        status(b.save(),-1,"残缺数据不得提交");check(read(f.file())==original,"缺参不能改变旧CSV");
+    });
+    run("旧六次单字段公式必须拒绝并保护原文件",[]{
+        Fixture f;const auto original=header()+row();write(f.file(),original);Batch b;status(b.dates({1261016}),1,"日期");
+        const float old_fields[]={0,10,11,12,9,100,1000};for(int type=1;type<=6;++type)status(call(Func3,1,{static_cast<float>(type)},{old_fields[type]},{1}),-999,"旧调用也不回填返回值");
+        status(b.save(),-1,"旧公式不得写入混合字段");check(read(f.file())==original,"旧公式不能破坏CSV");
+    });
     struct Period { int code; int reserved; const char *label; };
     for (auto p : std::vector<Period>{{0,0,"1m"},{1,0,"5m"},{2,0,"15m"},{3,0,"30m"},{4,0,"60m"},{5,0,"1d"},{6,0,"1w"},{7,0,"1mo"},{11,0,"1y"}}) {
         run(std::string("支持周期 ") + p.label, [=] {
@@ -498,7 +532,117 @@ void suite() {
             const auto logs=current_logs();check(std::any_of(logs.begin(),logs.end(),[](const auto &entry){return entry.message.rfind("数据未变化，跳过写盘：",0)==0;}),"跳过写盘应有明确日志");
             if(p.code==5){check_reports(logs,"ok",2);check(metric_number(report_fields(logs,"保存分段"),"write_ms")==0,"跳过写盘的写入耗时必须为零");}
         });
+        run(std::string("类型7仅日线及以上保存事件值，分钟列留空 ")+p.label,[=]{
+            Fixture f;Batch b(2,p.code);status(b.dates({1261015,1261016},{930,1030}),1,"日期");b.data();status(b.events({0,.5f},{0,.25f}),1,"类型7接收两个数组");status(b.save(),1,"事件保存");
+            const auto csv=read(f.file(p.label));contains(csv,",ExRights,ExDividend\n");contains(csv,p.code<=4?",1000,,\n":",50,25\n");check(lines(csv)==(p.code==6||p.code==7||p.code==11?2u:3u),"事件列不能改变原周期去重规则");
+            const auto identity=file_identity(f.file(p.label));Batch repeat(2,p.code);status(repeat.dates({1261015,1261016},{930,1030}),1,"重复日期");repeat.data();status(repeat.events({0,.5f},{0,.25f}),1,"重复事件");status(repeat.save(),1,"事件重导");unchanged_file(f.file(p.label),identity);
+        });
+        if(p.code<=4) {
+            run(std::string("分钟类型7不分配、不读取或传输事件数组 ")+p.label,[=]{
+                Fixture f;Batch b(1,p.code);status(b.dates({1261016},{1030}),1,"日期");b.data();
+                status(b.events({},{}),1,"分钟事件无需输入");const auto &item=state();
+                check(!item.has_events&&item.events[0].capacity()==0&&item.events[1].capacity()==0,"分钟不能预分配或传输事件数组");
+                status(b.save(),1,"分钟空事件保存");check(read(f.file(p.label))==event_header()+event_row("","",p.label,"2026-10-16 10:30:00"),"分钟两列必须为空而非零");
+            });
+            for(bool populated:{false,true})run(std::string("分钟旧公式迁移并清空全部历史事件 ")+p.label+" "+std::to_string(populated),[=]{
+                Fixture f;write(f.file(p.label),populated?event_header()+event_row("50","25",p.label,"2026-10-15 09:30:00")+event_row("0","25",p.label,"2026-10-16 10:30:00"):header()+row(p.label,"2026-10-15 09:30:00")+row(p.label,"2026-10-16 10:30:00"));
+                Batch b(1,p.code);b.complete({1261016},{1030});
+                check(read(f.file(p.label))==event_header()+event_row("","",p.label,"2026-10-15 09:30:00")+event_row("","",p.label,"2026-10-16 10:30:00"),"未覆盖历史也不得残留分钟事件值");
+            });
+        }
     }
+
+    run("后台直接收到分钟事件也只保留空列",[]{
+        Fixture f;Batch b(1,2);status(b.dates({1261016},{1030}),1,"日期");b.data();auto item=static_cast<const ExportJob &>(state());
+        item.has_events=true;item.events[0]={std::numeric_limits<float>::quiet_NaN()};item.events[1]={-25};
+        check(write_csv(item),"分钟不使用事件值");check(read(f.file("15m"))==event_header()+event_row("","","15m","2026-10-16 10:30:00"),"后台也必须执行分钟空列约定");
+    });
+    run("分钟旧事件CSV损坏仍拒绝覆盖",[]{
+        Fixture f;const auto original=event_header()+event_row("50","","15m","2026-10-16 10:30:00");write(f.file("15m"),original);
+        Batch b(1,2);status(b.dates({1261016},{1030}),1,"日期");b.data();status(b.save(),-1,"旧文件仍须完整校验");check(read(f.file("15m"))==original,"清空分钟事件不能掩盖旧文件损坏");
+    });
+
+    run("后台按原始相邻值提取等长事件数组且首项为零",[]{
+        Fixture f;Batch b(7);const Series dates{1261009,1261012,1261013,1261014,1261015,1261016,1261019};
+        status(b.dates(dates),1,"日期");b.data();status(b.events({10,20,20,30,30,60,66},{7,8,8,8,9,9,9}),1,"原始事件");status(b.save(),1,"提取保存");
+        const char *rights[]={"0","2000","0","3000","0","6000","6600"},*dividend[]={"0","800","0","0","900","0","0"};std::string expected=event_header();
+        for(size_t i=0;i<dates.size();++i)expected+=event_row(rights[i],dividend[i],"1d",format_ts(static_cast<int>(dates[i])+19000000,150000));
+        check(read(f.file())==expected,"两列须独立比较原始前值，并按原日期保留全部零值和变化值");
+    });
+    run("持续不变的非零原始事件必须全部输出零",[]{
+        Fixture f;Batch b(3);status(b.dates({1261014,1261015,1261016}),1,"日期");b.data();status(b.events({50,50,50},{25,25,25}),1,"恒定原始事件");status(b.save(),1,"保存");
+        check(read(f.file())==event_header()+event_row("0","0","1d","2026-10-14 15:00:00")+event_row("0","0","1d","2026-10-15 15:00:00")+event_row("0","0"),"不能把处理后的零作为下一根比较基准");
+    });
+    run("单条事件首项为零并修正已有事件值",[]{
+        Fixture f;write(f.file(),event_header()+event_row("50","25"));Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({60},{66}),1,"单条原始值");status(b.save(),1,"保存");
+        check(read(f.file())==event_header()+event_row("0","0"),"首条固定为零，不能留空、保留旧值或写原始值");
+    });
+    run("事件下降、归零及连续变化按当前值输出",[]{
+        Fixture f;Batch b(4);status(b.dates({1261013,1261014,1261015,1261016}),1,"日期");b.data();status(b.events({60,30,30,20},{10,0,0,10}),1,"变化原始值");status(b.save(),1,"保存");
+        check(read(f.file())==event_header()+event_row("0","0","1d","2026-10-13 15:00:00")+event_row("3000","0","1d","2026-10-14 15:00:00")+event_row("0","0","1d","2026-10-15 15:00:00")+event_row("2000","1000"),"变化值须由后台乘100后按原位置保存");
+    });
+    run("提取结果使用新数组且重复保存不会二次处理原始值",[]{
+        Fixture f;Batch b(4);status(b.dates({1261013,1261014,1261015,1261016}),1,"日期");b.data();status(b.events({10,20,20,30},{25,25,30,30}),1,"事件");auto item=static_cast<const ExportJob &>(state());const auto original=item;
+        check(write_csv(item),"首次直接保存");check(item.events[0]==original.events[0]&&item.events[1]==original.events[1],"提取不能修改任务的原始数组");
+        const auto identity=file_identity(f.file());check(write_csv(item),"原任务重复保存");unchanged_file(f.file(),identity);status(b.save(),1,"前台仍可提交原始数据");unchanged_file(f.file(),identity);
+    });
+    run("事件结果数组在保存分配失败后重新提取且旧历史保留",[]{
+        Fixture f;AllocationControl faults;write(f.file(),header()+row("1d","2026-10-13 15:00:00"));allocation_fault::temp_failures=2;
+        Batch b(3);status(b.dates({1261014,1261015,1261016}),1,"日期");b.data();status(b.events({10,20,20},{25,25,30}),1,"原始事件");status(b.save(),1,"重试保存");
+        check(allocation_fault::triggered==2,"保存须经历两次真实分配失败");
+        check(read(f.file())==event_header()+event_row("","","1d","2026-10-13 15:00:00")+event_row("0","0","1d","2026-10-14 15:00:00")+event_row("2000","0","1d","2026-10-15 15:00:00")+event_row("0","3000"),"重试不能再次处理结果数组或重复乘100");
+        for(const auto &file:fs::directory_iterator(f.dir/"csv"))check(file.path().extension()!=".tmp","重试不能遗留临时文件");
+    });
+
+    run("类型7原样复制双数组且保留传入float精度",[]{
+        Fixture f;Batch b(2);status(b.dates({1261015,1261016}),1,"日期");b.data();Series rights{0,.501234567f},dividend{0,.012345678f};const auto r=rights[1]*100.0f,d=dividend[1]*100.0f;
+        status(b.events(rights,dividend),1,"类型7第三参数是分红值而非上一步结果");rights[1]=dividend[1]=-999;status(b.save(),1,"保存");
+        const auto csv=read(f.file());const auto last=csv.rfind(',');const auto previous=csv.rfind(',',last-1);float actual_r=0,actual_d=0;
+        check(parse_number(csv.substr(previous+1,last-previous-1),actual_r)&&parse_number(csv.substr(last+1),actual_d)&&actual_r==r&&actual_d==d,"后台仅乘100一次并保留结果float精度");
+    });
+    run("旧CSV升级事件列并保留未采集历史为空",[]{
+        Fixture f;write(f.file(),header()+row("1d","2026-10-15 15:00:00")+row());Batch b(2);status(b.dates({1261016,1261019}),1,"日期");b.data();status(b.events({0,.5f},{0,.25f}),1,"事件");status(b.save(),1,"升级保存");
+        check(read(f.file())==event_header()+event_row("","","1d","2026-10-15 15:00:00")+event_row("0","0")+event_row("50","25","1d","2026-10-19 15:00:00"),"未采集历史留空，首项及变化值须按日期保存");
+    });
+    run("旧六字段公式保留重叠事件并为空标记新增历史",[]{
+        Fixture f;write(f.file(),event_header()+event_row("50","25"));Batch b(2);b.complete({1261016,1261019});
+        check(read(f.file())==event_header()+event_row("50","25")+event_row("","","1d","2026-10-19 15:00:00"),"未传类型7不得把已知事件覆盖为零，新增日期应为未知");
+    });
+    run("事件变化需要保存零值修正且完全相同跳过写盘",[]{
+        Fixture f;write(f.file(),event_header()+event_row("50","25"));const auto attempts=temp_file_calls.load();
+        for(int pass=0;pass<2;++pass){Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({0},{0}),1,"显式零值修正");status(b.save(),1,"保存");}
+        check(read(f.file())==event_header()+event_row("0","0")&&temp_file_calls==attempts+1,"事件修正必须提交，仅重复相同内容才能跳过");
+    });
+    for(int stage:{0,1,2,3})run("类型7调用顺序及长度保护 "+std::to_string(stage),[=]{
+        Fixture f;Batch b(2);status(b.dates({1261015,1261016}),1,"日期");if(stage)b.data();
+        if(stage==1)status(b.events({50,0},{0,25}),1,"首次事件");
+        const auto result=stage==2?call(Func3,1,{7},{50},{25}):call(Func3,2,{7,7},stage==3?Series{}:Series{50,0},Series{0,25});
+        status(result,-999,"事件接口不回填结果");check(state().failed,"早于行情、重复、长度不符或缺少数组均须拒绝");status(b.save(),-1,"错误后不可提交");check(!fs::exists(f.file()),"接口错误不得落盘");
+    });
+    run("类型7缺少分红数组必须拒绝",[]{Fixture f;Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({50},{}),-1,"缺少pIn3");status(b.save(),-1,"不完整事件不能保存");});
+    for(bool dividend:{false,true})for(float value:{-1.f,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()})run("单条原始事件不做数值校验且首项固定为零 "+std::to_string(dividend)+" "+std::to_string(value),[=]{
+        Fixture f;Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({dividend?50:value},{dividend?value:25}),1,"前台只复制");status(b.save(),1,"后台不校验首项原始数值");check(read(f.file())==event_header()+event_row("0","0"),"首项无需比较，始终保存零值");
+    });
+    const std::vector<std::string> bad_events={event_header()+event_row("bad","0"),event_header()+event_row("-1","0"),event_header()+event_row("50","nan"),event_header()+event_row("50",""),event_header()+event_row("50","25")+event_row("50","26"),header().substr(0,header().size()-1)+",ExRights\n"+event_row("50","25")};
+    for(size_t i=0;i<bad_events.size();++i)run("已有事件CSV损坏保护 "+std::to_string(i),[=]{
+        Fixture f;write(f.file(),bad_events[i]);Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({50},{25}),1,"事件");status(b.save(),-1,"坏旧文件必须拒绝");check(read(f.file())==bad_events[i],"错误事件列或冲突行必须原样保留");
+    });
+    run("事件列修改时替换失败仍保护原文件",[]{
+        Fixture f;const auto original=event_header()+event_row("50","25");write(f.file(),original);FileHandle hold(CreateFileA(f.file().string().c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr));
+        Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({0},{0}),1,"事件修改");status(b.save(),-1,"替换被占用");check(read(f.file())==original,"事件修改失败不能破坏旧CSV");
+    });
+    for(int missing:{0,1,2})run("后台独立检查事件数组完整性 "+std::to_string(missing),[=]{
+        Fixture f;Batch b;status(b.dates({1261016}),1,"日期");b.data();status(b.events({50},{25}),1,"事件");auto item=static_cast<const ExportJob &>(state());
+        if(missing<2)item.events[missing].clear();else item.has_events=false;check(!write_csv(item),"缺少数组或标识不一致必须拒绝");check(!fs::exists(f.file()),"不完整事件不能落盘");
+    });
+    run("旧公式修正行情时同日事件仍保留",[]{
+        Fixture f;write(f.file(),event_header()+event_row("50","25"));Batch b;status(b.dates({1261016}),1,"日期");
+        const float v[]={0,10,10.5f,12,9,100,1000};b.data(v);status(b.save(),1,"保存");contains(read(f.file()),",10,12,9,10.5,100,1000,50,25\n");
+    });
+    run("新股票及旧公式不能沿用上一股票的事件数组",[]{
+        Fixture f;Batch first;status(first.dates({1261016}),1,"日期");first.data();status(first.events({50},{25}),1,"事件");status(first.save(),1,"首只股票保存");
+        Batch next(1,5,0,600001);next.complete({1261016});check(read(f.file("1d","600001.SH")).find("ExRights")==std::string::npos,"旧公式新股票不能误带事件标识和数组");
+    });
 
     run("仅重叠历史片段未变化仍跳过写盘",[]{
         Fixture f;Batch first(3);first.complete({1261014,1261015,1261016});const auto original=read(f.file());const auto identity=file_identity(f.file());
@@ -509,13 +653,13 @@ void suite() {
         for(int pass=0;pass<2;++pass){
             const auto attempts=temp_file_calls.load();Batch b;status(b.dates({1261016}),1,"日期");
             const float v[]={0,10.1234567f,11.1234567f,12.1234567f,9.1234567f,12345678.f,FLT_MAX};
-            for(int type=1;type<=6;++type)status(b.field(type,{v[type]}),1,"字段");status(b.save(),1,"保存");
+            b.data(v);status(b.save(),1,"保存");
             if(pass)check(temp_file_calls==attempts,"原始浮点值与读回值不同但输出相同应跳过写盘");
         }
     });
     run("浮点修正在输出精度内不可见时跳过写盘",[]{
         Fixture f;write(f.file(),header()+"600000.SH,1d,2026-10-16 15:00:00,10,12,9,11,1.23457e+07,1000\n");const auto identity=file_identity(f.file());
-        Batch b;status(b.dates({1261016}),1,"日期");for(int type=1;type<=6;++type){float v[]={0,10,11,12,9,12345679.f,1000};status(b.field(type,{v[type]}),1,"字段");}
+        Batch b;status(b.dates({1261016}),1,"日期");const float v[]={0,10,11,12,9,12345679.f,1000};b.data(v);
         status(b.save(),1,"输出精度内相同");unchanged_file(f.file(),identity);
     });
     run("原文件禁止替换但内容未变化仍成功",[]{
@@ -525,15 +669,15 @@ void suite() {
     });
     run("正负零输出不同仍保存且重复负零跳过写盘",[]{
         Fixture f;write(f.file(),header()+"600000.SH,1d,2026-10-16 15:00:00,10,12,9,11,0,1000\n");const auto attempts=temp_file_calls.load();
-        for(int pass=0;pass<2;++pass){Batch b;status(b.dates({1261016}),1,"日期");const float v[]={0,10,11,12,9,-0.0f,1000};for(int type=1;type<=6;++type)status(b.field(type,{v[type]}),1,"有符号零字段");status(b.save(),1,"有符号零保存");}
+        for(int pass=0;pass<2;++pass){Batch b;status(b.dates({1261016}),1,"日期");const float v[]={0,10,11,12,9,-0.0f,1000};b.data(v);status(b.save(),1,"有符号零保存");}
         contains(read(f.file()),",-0,1000\n");check(temp_file_calls==attempts+1,"输出字节不同必须保存，相同则跳过");
     });
     for(int changed=1;changed<=6;++changed)run("修正数值仍保存字段 "+std::to_string(changed),[=]{
         Fixture f;write(f.file(),header()+row("1d","2026-10-15 15:00:00")+row());const auto original=read(f.file());const auto attempts=temp_file_calls.load();
         Batch b;status(b.dates({1261016}),1,"日期");const float old[]={0,10,11,12,9,100,1000},updated[]={0,10.5f,10.5f,13,8,200,2000};
-        for(int type=1;type<=6;++type)status(b.field(type,{type==changed?updated[type]:old[type]}),1,"修正字段");status(b.save(),1,"修改后保存");
+        float current[7]{};for(int i=1;i<=6;++i)current[i]=i==changed?updated[i]:old[i];b.data(current);status(b.save(),1,"修改后保存");
         const auto csv=read(f.file());check(csv!=original&&lines(csv)==3,"修改必须保存且不增加重复行");contains(csv,row("1d","2026-10-15 15:00:00"));check(temp_file_calls==attempts+1,"修改应经过临时文件提交");
-        const auto identity=file_identity(f.file());Batch repeat;status(repeat.dates({1261016}),1,"重导日期");for(int type=1;type<=6;++type)status(repeat.field(type,{type==changed?updated[type]:old[type]}),1,"重复字段");status(repeat.save(),1,"修正后重复导出");unchanged_file(f.file(),identity);
+        const auto identity=file_identity(f.file());Batch repeat;status(repeat.dates({1261016}),1,"重导日期");repeat.data(current);status(repeat.save(),1,"修正后重复导出");unchanged_file(f.file(),identity);
     });
     const auto canonical=header()+row();
     auto crlf=canonical;for(size_t at=0;(at=crlf.find('\n',at))!=std::string::npos;at+=2)crlf.insert(at,1,'\r');
@@ -553,7 +697,7 @@ void suite() {
     run("15分钟同日合并更新重叠时间并保留历史",[]{
         Fixture f;Batch first(2,2);first.complete({1261016,1261016},{930,945});
         Batch next(2,2);status(next.dates({1261016,1261016},{945,1000}),1,"15分钟接收时间");
-        for(int type=1;type<=6;++type){float value[]={0,10,11,12,9,100,1000};status(next.field(type,type==5?Series{200,300}:values(2,value[type])),1,"15分钟字段");}
+        auto fields=default_fields(next.n);fields[4]={200,300};next.data(fields);
         status(next.save(),1,"15分钟合并");const auto csv=read(f.file("15m"));
         check(lines(csv)==4,"重叠15分钟应更新且保留三个时间点");
         contains(csv,"600000.SH,15m,2026-10-16 09:30:00,10,12,9,11,100,1000");
@@ -570,8 +714,8 @@ void suite() {
     run("长周期无 TIME 仍可保存", [] { Fixture f; Batch b; b.complete(); contains(read(f.file()), "15:00:00"); });
     run("按批读取默认时间并忽略旧时区配置", [] { Fixture f("tz=-05\n"); write(f.dir / "saveAsCVS.ini", "[export]\ncsv_dir=csv\ndefault_time=145959\ntz=-05\n"); Batch b; b.complete(); auto csv=read(f.file()); contains(csv,"14:59:59"); check(csv.find("-05") == std::string::npos,"时区配置不得影响新输出"); });
     run("配置不可读不得静默使用默认目录和时间", [] { Fixture f; write(f.dir/"saveAsCVS.ini","[export]\ncsv_dir=required-directory\ndefault_time=145959\n"); FileHandle lock(CreateFileA((f.dir/"saveAsCVS.ini").string().c_str(),GENERIC_WRITE,FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr)); status(call(Func4,1,{600000},{1},{5}),-1,"配置不可读"); check(!fs::exists(f.file()),"配置错误不得静默写入默认目录"); });
-    run("保持六位有效数字输出", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); for(int t=1;t<=6;++t) { float v[]={0,10,11,12,9,12345678,1000}; status(b.field(t,{v[t]}),1,"字段"); } status(b.save(),1,"保存"); contains(read(f.file()),"1.23457e+07"); });
-    run("有限极值保持六位设计并可再次合并", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); for(int type=1;type<=6;++type) { float v[]={0,10,11,12,9,100,std::numeric_limits<float>::max()}; status(b.field(type,{v[type]}),1,"有限数值"); } status(b.save(),1,"有限极值保存"); contains(read(f.file()),"3.40282e+38"); Batch next; next.complete({1261019}); check(lines(read(f.file()))==3,"格式化后的极值必须能被完整读取并合并"); });
+    run("保持六位有效数字输出", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); const float v[]={0,10,11,12,9,12345678,1000};b.data(v); status(b.save(),1,"保存"); contains(read(f.file()),"1.23457e+07"); });
+    run("有限极值保持六位设计并可再次合并", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); const float v[]={0,10,11,12,9,100,std::numeric_limits<float>::max()};b.data(v); status(b.save(),1,"有限极值保存"); contains(read(f.file()),"3.40282e+38"); Batch next; next.complete({1261019}); check(lines(read(f.file()))==3,"格式化后的极值必须能被完整读取并合并"); });
     run("跨年 ISO 周年不碰撞", [] { Fixture f; Batch b(2,6); b.complete({1190104,1191231}); auto csv=read(f.file("1w")); check(lines(csv)==3,"两个 ISO 周都须保留"); contains(csv,"2019W01"); contains(csv,"2020W01"); });
     run("同一跨年 ISO 周只保留较晚日期", [] { Fixture f; Batch b(2,6); b.complete({1201231,1210101}); auto csv=read(f.file("1w")); check(lines(csv)==2,"同一 ISO 周应合并"); contains(csv,"2020W53"); contains(csv,"2021-01-01"); });
     for (const char *suffix : {"+08", "+08:00"}) run(std::string("兼容历史时区 ") + suffix, [=] {
@@ -593,20 +737,20 @@ void suite() {
     run("闰日可保存", [] { Fixture f; Batch b; b.complete({1240229}); contains(read(f.file()),"2024-02-29"); });
     for(float time : {2460.f,1260.f,-1.f,930.5f}) run("非法分钟时间 " + std::to_string(time), [=] { Fixture f; Batch b(1,0); status(b.dates({1261016},{time}),1,"原始分钟时间已接收");b.data();status(b.save(),-1,"后台拒绝非法时间"); });
     run("分钟线缺少 TIME 不得保存", [] { Fixture f; Batch b(1,0); status(b.dates({1261016}),-1,"缺少分钟时间"); status(b.save(),-1,"失败批保存"); });
-    for(float invalid : {std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) run(std::isnan(invalid)?"拒绝 NaN":"拒绝 Inf", [=] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期");for(int t=1;t<=6;++t){float v[]={0,10,11,12,9,100,1000};status(b.field(t,{t==1?invalid:v[t]}),1,"原始数值已接收");}status(b.save(),-1,"后台拒绝非法数值"); });
-    for(int type : {5,6}) run("拒绝负量额字段 " + std::to_string(type), [=] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期");for(int t=1;t<=6;++t){float v[]={0,10,11,12,9,100,1000};status(b.field(t,{t==type?-1.f:v[t]}),1,"原始量额已接收");}status(b.save(),-1,"后台拒绝负量额"); });
-    run("价格上下界矛盾禁止保存", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); bool rejected=false; for(int t=1;t<=6;++t) { float v[]={0,10,11,9,8,100,1000}; auto result=b.field(t,{v[t]}); if(result[0]==-1) { rejected=true; break; } status(result,1,"字段"); } status(b.save(),-1,"矛盾价格保存"); check(!fs::exists(f.file()),"矛盾价格不得落盘"); });
-    run("缺字段不能保存", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); status(b.field(1,{10}),1,"开盘"); status(b.save(),-1,"缺字段"); });
-    run("字段乱序使批次永久失败", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); status(b.field(2,{11}),-1,"乱序"); status(b.field(1,{10}),-1,"失败批继续传"); status(b.save(),-1,"失败批保存"); });
-    run("长度变化不能清空数据后成功保存", [] { Fixture f; Batch b(2); status(b.dates({1261015,1261016}),1,"日期"); status(b.field(1,{10,10}),1,"开盘"); status(b.field(2,{11},1),-1,"改变长度"); status(b.save(),-1,"失败批保存"); });
+    for(float invalid : {std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) run(std::isnan(invalid)?"拒绝 NaN":"拒绝 Inf", [=] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期");auto fields=default_fields(b.n);fields[0]={invalid};b.data(fields);status(b.save(),-1,"后台拒绝非法数值"); });
+    for(int type : {5,6}) run("拒绝负量额字段 " + std::to_string(type), [=] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期");auto fields=default_fields(b.n);fields[type-1]={-1};b.data(fields);status(b.save(),-1,"后台拒绝负量额"); });
+    run("价格上下界矛盾禁止保存", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); const float v[]={0,10,11,9,8,100,1000};b.data(v); status(b.save(),-1,"矛盾价格保存"); check(!fs::exists(f.file()),"矛盾价格不得落盘"); });
+    run("缺字段不能保存", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); status(b.pair(1,{10},{11}),1,"开盘"); status(b.save(),-1,"缺字段"); });
+    run("字段乱序使批次永久失败", [] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); status(b.pair(2,{12},{9}),-1,"乱序"); status(b.pair(1,{10},{11}),-1,"失败批继续传"); status(b.save(),-1,"失败批保存"); });
+    run("长度变化不能清空数据后成功保存", [] { Fixture f; Batch b(2); status(b.dates({1261015,1261016}),1,"日期"); status(b.pair(1,{10,10},{11,11}),1,"开盘"); status(b.pair(2,{12},{9},1),-1,"改变长度"); status(b.save(),-1,"失败批保存"); });
     run("一个批次只能保存一次", [] { Fixture f; Batch b; b.complete(); auto old=read(f.file()); status(b.save(),-1,"重复保存"); check(read(f.file())==old,"重复保存不得改文件"); });
-    run("重新开始清空旧股票及旧数组", [] { Fixture f; Batch old(2); old.complete({1261015,1261016}); const auto original=read(f.file()); Batch current(1,5,0,600001); status(current.dates({1261019}),1,"新股票日期"); status(current.field(1,{20}),1,"新股票开盘"); status(current.save(),-1,"新股票缺字段"); status(call(Func7,1,{0},{0},{0}),-1,"先报告缺字段失败"); check(!fs::exists(f.file("1d","600001.SH")),"新股票不得沿用旧数组补全"); check(read(f.file())==original,"新股票处理不能改写旧股票"); Batch retry(1,5,0,600001); retry.complete({1261019}); auto csv=read(f.file("1d","600001.SH")); check(lines(csv)==2,"新股票只能包含本次数据"); contains(csv,"600001.SH,1d,2026-10-19"); check(csv.find("600000.SH")==std::string::npos,"旧代码不得残留"); });
-    run("失败后重新开始可完整恢复", [] { Fixture f; Batch bad; status(bad.dates({1261016}),1,"日期"); status(bad.field(2,{11}),-1,"故意乱序"); status(bad.field(1,{10}),-1,"失败后不可续传"); status(call(Func7,1,{0},{0},{0}),-1,"失败轮次必须先明确报告"); Batch recovered; recovered.complete({1261019}); check(lines(read(f.file()))==2,"新开始应清除失败状态"); });
-    for(int stage : {5,2,3,1}) run("上一步失败阻断函数 " + std::to_string(stage), [=] { Fixture f; if(stage==5) { auto start=call(Func4,1,{600000},{1},{5}); status(start,1,"开始导出"); status(call(Func5,1,{-1},{0},{0}),-1,"失败依赖"); status(call(Func5,1,start,{0},{0}),-1,"本次不可恢复续传"); } else { Batch b; if(stage!=2) status(b.dates({1261016}),1,"日期"); if(stage==1) b.data(); if(stage==2) status(call(Func2,1,{1261016},{0},{-1}),-1,"失败日期依赖"); if(stage==3) status(call(Func3,1,{1},{10},{-1}),-1,"失败字段依赖"); if(stage==1) status(call(Func1,1,{3},{-1},{0}),-1,"失败保存依赖"); status(b.save(),-1,"本次不可恢复提交"); } check(!fs::exists(f.file()),"上一步失败不得落盘"); });
-    for(float dependency : {0.f,2.f,1000000.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) run("前一步结果必须精确为一 " + std::to_string(dependency), [=] { Fixture f; Batch b; status(b.dates({1261016}),1,"日期"); status(call(Func3,1,{1},{10},{dependency}),-1,"非一依赖"); status(b.field(1,{10}),-1,"错误依赖后不可续传"); status(b.save(),-1,"错误依赖后不可保存"); check(!fs::exists(f.file()),"非一依赖不得落盘"); });
+    run("重新开始清空旧股票及旧数组", [] { Fixture f; Batch old(2); old.complete({1261015,1261016}); const auto original=read(f.file()); Batch current(1,5,0,600001); status(current.dates({1261019}),1,"新股票日期"); status(current.pair(1,{20},{21}),1,"新股票开盘"); status(current.save(),-1,"新股票缺字段"); status(call(Func7,1,{0},{0},{0}),-1,"先报告缺字段失败"); check(!fs::exists(f.file("1d","600001.SH")),"新股票不得沿用旧数组补全"); check(read(f.file())==original,"新股票处理不能改写旧股票"); Batch retry(1,5,0,600001); retry.complete({1261019}); auto csv=read(f.file("1d","600001.SH")); check(lines(csv)==2,"新股票只能包含本次数据"); contains(csv,"600001.SH,1d,2026-10-19"); check(csv.find("600000.SH")==std::string::npos,"旧代码不得残留"); });
+    run("失败后重新开始可完整恢复", [] { Fixture f; Batch bad; status(bad.dates({1261016}),1,"日期"); status(bad.pair(2,{12},{9}),-1,"故意乱序"); status(bad.pair(1,{10},{11}),-1,"失败后不可续传"); status(call(Func7,1,{0},{0},{0}),-1,"失败轮次必须先明确报告"); Batch recovered; recovered.complete({1261019}); check(lines(read(f.file()))==2,"新开始应清除失败状态"); });
+    for(int stage : {5,2,1}) run("上一步失败阻断函数 " + std::to_string(stage), [=] { Fixture f; if(stage==5) { auto start=call(Func4,1,{600000},{1},{5}); status(start,1,"开始导出"); status(call(Func5,1,{-1},{0},{0}),-1,"失败依赖"); status(call(Func5,1,start,{0},{0}),-1,"本次不可恢复续传"); } else { Batch b; if(stage!=2) status(b.dates({1261016}),1,"日期"); if(stage==1) b.data(); if(stage==2) status(call(Func2,1,{1261016},{0},{-1}),-1,"失败日期依赖"); if(stage==1) status(call(Func1,1,{3},{-1},{0}),-1,"失败保存依赖"); status(b.save(),-1,"本次不可恢复提交"); } check(!fs::exists(f.file()),"上一步失败不得落盘"); });
+    for(float dependency : {0.f,2.f,1000000.f,std::numeric_limits<float>::quiet_NaN(),std::numeric_limits<float>::infinity()}) run("日期前一步结果必须精确为一 " + std::to_string(dependency), [=] { Fixture f; Batch b; status(call(Func2,1,{1261016},{0},{dependency}),-1,"非一日期依赖"); status(b.dates({1261016}),-1,"错误依赖后不可续传"); status(b.save(),-1,"错误依赖后不可保存"); check(!fs::exists(f.file()),"非一依赖不得落盘"); });
     run("五次重叠导出只有一个文件并保留历史", [] { Fixture f; const Series dates[]={ {1261015,1261016},{1261016,1261019},{1261019,1261020},{1261020,1261021},{1261021,1261022} }; for(const auto &date:dates) { Batch b(2); b.complete(date); } size_t files=0; for(const auto &entry:fs::directory_iterator(f.dir/"csv")) if(entry.path().extension()==".csv") ++files; check(files==1,"重复开始不能生成带编号的新文件"); const auto csv=read(f.file()); check(lines(csv)==7,"重叠历史应去重并保留六个日期"); contains(csv,"2026-10-15"); contains(csv,"2026-10-22"); });
     run("旧 CSV 超出浮点范围必须拒绝", [] { Fixture f; auto original=header()+"600000.SH,1d,2026-10-15 15:00:00,10,12,9,11,100,1e100\n"; write(f.file(),original); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); status(b.save(),-1,"超范围数值"); check(read(f.file())==original,"不能将超范围数值截成最大值再覆盖"); });
-    run("重新开始允许更改数组长度", [] { Fixture f; Batch old(2); status(old.dates({1261015,1261016}),1,"旧长度日期"); status(old.field(1,{10,10}),1,"旧长度开盘"); Batch current(1); current.complete({1261019}); const auto csv=read(f.file()); check(lines(csv)==2,"重新开始必须丢弃旧长度数据"); check(csv.find("2026-10-15")==std::string::npos,"旧数组不得残留"); });
+    run("重新开始允许更改数组长度", [] { Fixture f; Batch old(2); status(old.dates({1261015,1261016}),1,"旧长度日期"); status(old.pair(1,{10,10},{11,11}),1,"旧长度开盘"); Batch current(1); current.complete({1261019}); const auto csv=read(f.file()); check(lines(csv)==2,"重新开始必须丢弃旧长度数据"); check(csv.find("2026-10-15")==std::string::npos,"旧数组不得残留"); });
     run("当前导出的零长度调用使本次失败", [] { Fixture f; Batch b; float out=-999, type=1, data=10, previous=b.previous[0]; Func3(0,&out,&type,&data,&previous); status(b.dates({1261016}),-1,"零长度后继续输入"); status(b.save(),-1,"零长度失败后保存"); check(!fs::exists(f.file()),"无效导出不得落盘"); });
     run("旧 CSV 最后一行没有换行仍完整读取", [] { Fixture f; auto original=header()+row("1d","2026-10-15 15:00:00"); original.pop_back(); write(f.file(),original); Batch b; b.complete(); check(lines(read(f.file()))==3,"不得丢弃末尾没有换行的历史行"); });
     run("其他时区不得静默迁移", [] { Fixture f; auto original=header()+row("1d","2026-10-15 15:00:00-05"); write(f.file(),original); Batch b; status(b.dates({1261016}),1,"日期"); b.data(); status(b.save(),-1,"未支持时区"); check(read(f.file())==original,"其他时区原文件必须保留"); });
@@ -772,7 +916,7 @@ void suite() {
         status(call(Func7,1,{0},{0},{0}),-1,"被取消导出不能误报排空成功");check(!fs::exists(f.file()),"被取消采集不得生成CSV");
     });
     run("排空放弃尚未提交的采集必须报告中止且下一周期可恢复",[]{
-        Fixture f;Batch partial(2);status(partial.dates({1261015,1261016}),1,"未提交日期");status(partial.field(1,{10,10}),1,"仅接收开盘");
+        Fixture f;Batch partial(2);status(partial.dates({1261015,1261016}),1,"未提交日期");status(partial.pair(1,{10,10},{11,11}),1,"仅接收开盘");
         status(call(Func6,1,{5},{0},{0}),1,"未提交采集应仍持有预留");
         status(call(Func7,1,{0},{0},{0}),-1,"放弃未提交采集不可误报全部成功");
         status(call(Func6,1,{5},{0},{0}),0,"中止后预留必须归零");status(call(Func6,1,{0},{0},{0}),0,"不完整任务不得进入后台");
@@ -824,7 +968,7 @@ void dll_smoke(const fs::path &dllPath, int logLevel = 1) {
         previous=call(function("Func5"),1,previous,{0},{0});status(previous,1,"DLL 设置");
         previous=call(function("Func2"),1,{1261016},{0},previous);status(previous,1,"DLL 日期");
         float data[]={0,10,11,12,9,100,1000};
-        for(int type=1;type<=6;++type) {previous=call(function("Func3"),1,{static_cast<float>(type)},{data[type]},previous);status(previous,1,"DLL 字段");}
+        native_fields(function("Func3"),1,field_values(1,data));
         previous=call(function("Func1"),1,{3},previous,{0});status(previous,1,"DLL 接收任务");
         status(call(function("Func7"),1,{0},{0},{0}),1,"DLL 排空后确认保存");
         check(fs::exists(directory/"dll-csv"/"_bg_0-1000_0-8")&&status_files(directory/"dll-csv")==1&&fs::file_size(directory/"dll-csv"/"_bg_0-1000_0-8")==0,"真实DLL排空须等待状态线程发布唯一空文件后退出");
@@ -858,7 +1002,7 @@ void dll_existing_threads_smoke(const fs::path &dllPath) {
             previous=call(functions[4],1,previous,{0},{0});status(previous,1,"工作线程设置");
             previous=call(functions[1],1,{1261016},{0},previous);status(previous,1,"工作线程日期");
             float data[]={0,10,11,12,9,100,1000};
-            for(int type=1;type<=6;++type) {previous=call(functions[2],1,{static_cast<float>(type)},{data[type]},previous);status(previous,1,"工作线程字段");}
+            native_fields(functions[2],1,field_values(1,data));
             previous=call(functions[0],1,{3},previous,{0});status(previous,1,"工作线程提交");
         } catch(const std::exception &e) { errors[index]=e.what(); }
     };
@@ -891,7 +1035,7 @@ void dll_submit_one(HMODULE module,int code,int date,int period=5,int time=0) {
     previous=call(dll_function(module,"Func5"),1,previous,{0},{0});status(previous,1,"生命周期设置");
     previous=call(dll_function(module,"Func2"),1,{static_cast<float>(date)},{static_cast<float>(time)},previous);status(previous,1,"生命周期日期");
     float data[]={0,10,11,12,9,100,1000};
-    for(int type=1;type<=6;++type){previous=call(dll_function(module,"Func3"),1,{static_cast<float>(type)},{data[type]},previous);status(previous,1,"生命周期数值");}
+    native_fields(dll_function(module,"Func3"),1,field_values(1,data));
     status(call(dll_function(module,"Func1"),1,{3},previous,{0}),1,"生命周期任务提交");
 }
 void dll_period_15m(const fs::path &source) {
@@ -922,7 +1066,7 @@ void dll_deferred_invalid(const fs::path &source,int kind) {
         previous=call(dll_function(host,"Func5"),n,previous,values(n,0),values(n,0));status(previous,1,"原始输入设置");
         const Series dates=kind==5?Series{1261016,1261015}:Series{kind==0?nan:(kind==1?1261331.f:1261016.f)};
         previous=call(dll_function(host,"Func2"),n,dates,values(n,kind==2?std::numeric_limits<float>::infinity():930.f),previous);status(previous,1,"非法内容只做安全复制");
-        for(int type=1;type<=6;++type){float v[]={0,10,11,12,9,100,1000};float input=v[type];if(kind==3&&type==5)input=-1;if(kind==4&&type==3)input=std::numeric_limits<float>::infinity();previous=call(dll_function(host,"Func3"),n,values(n,static_cast<float>(type)),values(n,input),previous);status(previous,1,"原始数值复制");}
+        auto fields=default_fields(n);if(kind==3)fields[4]=values(n,-1);if(kind==4)fields[2]=values(n,std::numeric_limits<float>::infinity());native_fields(dll_function(host,"Func3"),n,fields);
         status(call(dll_function(host,"Func1"),n,values(n,3),previous,values(n,0)),1,"非法内容任务已入队");
         dll_submit_one(host,600001,1261019); // 错误任务不得阻止后续股票。
         status(call(dll_function(host,"Func7"),1,{0},{0},{0}),-1,"后台校验失败必须汇总");
@@ -1040,6 +1184,33 @@ void dll_process_exit(const fs::path &source) {
     DWORD exit_code=0;GetExitCodeProcess(process.hProcess,&exit_code);CloseHandle(process.hThread);CloseHandle(process.hProcess);
     check(waited==WAIT_OBJECT_0,"未排空的独立子进程在退出时锁死");check(exit_code==0,"未排空退出发生异常，退出码 "+std::to_string(exit_code));
 }
+void dll_events(const fs::path &source) {
+    const auto dir=root/"dll-events";fs::create_directories(dir);const auto dll=dir/"events.dll";copy_runtime(source,dll);
+    write(dir/"saveAsCVS.ini","[log]\nmode=file\nlevel=1\nfile=events.log\n[export]\ncsv_dir=csv\n[async]\nworker_threads=2\n");
+    HMODULE host=LoadLibraryA(dll.string().c_str());check(host!=nullptr,"事件DLL无法加载");
+    try {
+        auto registration=reinterpret_cast<BOOL (*)(PluginTCalcFuncInfo **)>(GetProcAddress(host,"RegisterTdxFunc"));PluginTCalcFuncInfo *info=nullptr;check(registration&&registration(&info),"事件DLL注册失败");
+        auto submit=[&](int code,bool events,int period=5){
+            auto previous=call(dll_function(host,"Func4"),2,values(2,static_cast<float>(code)),values(2,1),values(2,static_cast<float>(period)));status(previous,1,"开始");
+            previous=call(dll_function(host,"Func5"),2,previous,values(2,0),values(2,0));status(previous,1,"口径");
+            previous=call(dll_function(host,"Func2"),2,{1261015,1261016},{930,945},previous);status(previous,1,"日期");
+            native_fields(dll_function(host,"Func3"),2,default_fields(2));
+            if(events)native_pair(dll_function(host,"Func3"),2,7,{0,.5f},{0,.25f});
+            status(call(dll_function(host,"Func1"),2,{3,3},previous,{0,0}),1,"真实提交");
+        };
+        submit(600000,true);wait_for_condition([&]{return call(dll_function(host,"Func6"),1,{0},{0},{0})[0]==0;},"首次事件任务未完成");
+        const auto file=dir/"csv"/"600000.SH.1d.csv";const auto identity=file_identity(file);const auto original=read(file);
+        {FileHandle hold(CreateFileA(file.string().c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));submit(600001,false);submit(600000,true);submit(600002,true,2);submit(600003,false,2);status(call(dll_function(host,"Func7"),1,{0},{0},{0}),1,"分钟和日线、新旧公式混用与重复事件均须成功排空");}
+        unchanged_file(file,identity);check(read(file)==original,"真实DLL重复事件不能重写CSV");contains(original,",ExRights,ExDividend\n");contains(original,",0,0\n");contains(original,",50,25\n");
+        check(read(dir/"csv"/"600001.SH.1d.csv").find("ExRights")==std::string::npos,"真实DLL日线旧公式不能残留事件数组");
+        for(int code:{600002,600003}){
+            const auto csv=read(dir/"csv"/(std::to_string(code)+".SH.15m.csv"));contains(csv,",ExRights,ExDividend\n");
+            check(std::count(csv.begin(),csv.end(),'\n')==3&&csv.find(",50,0\n")==std::string::npos&&csv.find(",0,25\n")==std::string::npos,"真实DLL分钟新旧公式均不得保存事件值");
+            check(csv.find(",1000,,\n")!=std::string::npos,"分钟应留下两个空值");
+        }
+    } catch(...) {call(dll_function(host,"Func7"),1,{0},{0},{0});FreeLibrary(host);throw;}
+    FreeLibrary(host);
+}
 } // namespace test
 
 int main(int argc, char **argv) {
@@ -1058,6 +1229,7 @@ int main(int argc, char **argv) {
         for(int workers:{2,8,32,128})test::run("实际DLL按"+std::to_string(workers)+"线程混合保存12个文件96个任务",[&]{test::dll_pool_bulk(argv[2],workers);});
         test::run("实际DLL并行保存时损坏文件保持且其他文件完整",[&]{test::dll_pool_bulk(argv[2],8,true);});
         test::run("实际DLL支持15分钟同日合并与去重",[&]{test::dll_period_15m(argv[2]);});
+        test::run("实际DLL事件双数组跨进程保存、重复跳过及新旧公式混用",[&]{test::dll_events(argv[2]);});
         for(int kind=0;kind<6;++kind)test::run("实际DLL后台拒绝非法原始输入并继续后续任务 "+std::to_string(kind),[&]{test::dll_deferred_invalid(argv[2],kind);});
     }
     else test::suite();

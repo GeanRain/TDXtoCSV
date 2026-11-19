@@ -25,10 +25,12 @@ struct ExportJob
     std::vector<float> dates; // 通达信原始 DATE，转换和内容校验在后台完成。
     std::vector<float> times; // 分钟周期的原始 HHMM；长周期不使用。
     std::vector<float> series[6];
+    std::vector<float> events[2]; // 日线及以上的原始SPLIT，独立后台提取相邻变化值并乘100。
+    bool has_events = false; // 分钟或旧公式未提供事件，不能把未知事件当成零。
     ExportClock::time_point started{}, queued{};
     DWORD caller_thread = 0;
     std::uint64_t id = 0;
-    double call_ms[10]{};
+    double call_ms[11]{};
     double save_ms[4]{};
     double save_call_ms = 0;
     double queue_wait_ms = 0;
@@ -42,6 +44,8 @@ inline std::uint64_t job_memory(const ExportJob &job) noexcept
     bytes += static_cast<std::uint64_t>(job.dates.capacity() + job.times.capacity()) * sizeof(float);
     for (const auto &series : job.series)
         bytes += static_cast<std::uint64_t>(series.capacity()) * sizeof(float);
+    for (const auto &events : job.events)
+        bytes += static_cast<std::uint64_t>(events.capacity()) * sizeof(float);
     return bytes;
 }
 

@@ -34,6 +34,7 @@ void encode_job(Buffer &b,const ExportJob &j)
     b.u32(j.count);b.u32(j.native_period);b.u32(j.default_time);b.u32(j.minute?1:0);b.u32(j.caller_thread);
     b.str(j.symbol);b.str(j.period);b.str(j.csv_dir);
     for(double v:j.call_ms)b.real(v);
+    b.u32(j.has_events?1:0);
 }
 ExportJob decode_job(Reader &r)
 {
@@ -49,6 +50,7 @@ ExportJob decode_job(Reader &r)
        j.csv_dir.empty()||!(j.csv_dir.size()>2&&j.csv_dir[1]==':'&&(j.csv_dir[2]=='\\'||j.csv_dir[2]=='/')||j.csv_dir.rfind("\\\\",0)==0))
         throw std::runtime_error("后台任务代码、周期或绝对路径无效");
     for(double &v:j.call_ms){v=r.real();if(!std::isfinite(v)||v<0)throw std::runtime_error("后台任务计时无效");}
+    const auto events=r.u32();if(events>1)throw std::runtime_error("后台事件标识无效");j.has_events=events!=0;
     j.started=ExportClock::now();return j;
 }
 std::uint64_t creation_time(HANDLE process)
@@ -59,7 +61,7 @@ std::uint64_t creation_time(HANDLE process)
 std::vector<float> &array(ExportJob &j,unsigned field)
 {
     if(field==0)return j.dates;if(field==1)return j.times;
-    if(field<8)return j.series[field-2];throw std::runtime_error("行情数组编号无效");
+    if(field<8)return j.series[field-2];if(field<10)return j.events[field-8];throw std::runtime_error("行情数组编号无效");
 }
 std::wstring wide(const std::string &text)
 {

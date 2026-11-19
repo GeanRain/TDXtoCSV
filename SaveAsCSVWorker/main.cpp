@@ -179,7 +179,7 @@ class Server
                             if(stopping||current->cancelled||WaitForSingleObject(parent.value,0)!=WAIT_TIMEOUT)throw std::runtime_error("后台接收已停止");
                             try{
                                 Reader meta(packet.body.data);auto job=decode_job(meta);meta.end();job.id=current->id;
-                                for(unsigned field=0;field<8;++field)if(field!=1||job.minute)array(job,field).resize(job.count);
+                                for(unsigned field=0;field<array_count(job);++field)if(field!=1||job.minute)array(job,field).resize(job.count);
                                 if(job_memory(job)>current->bytes)throw std::runtime_error("接收数组超过预留额度");
                                 current->job=std::move(job);break;
                             }catch(const std::bad_alloc &){if(GetTickCount64()>=next_report){next_report=GetTickCount64()+5000;try{LOG_WARN("后台接收内存分配重试 id=%llu retry_ms=200",current->id);}catch(...){};}WaitForSingleObject(stop_data.value,200);}
@@ -191,12 +191,12 @@ class Server
                     Reader r(packet.body.data);
                     if(packet.command==Command::Data){
                         const auto field=r.u32(),offset=r.u32();const auto bytes=packet.body.data.size()-r.at;
-                        if(field!=current->next_field||offset!=current->offset||field>=8||!bytes||bytes%4)throw std::runtime_error("数据数组顺序或偏移错误");
+                        if(field!=current->next_field||offset!=current->offset||field>=array_count(current->job)||!bytes||bytes%4)throw std::runtime_error("数据数组顺序或偏移错误");
                         auto &values=array(current->job,field);if(offset>values.size()||bytes/4>values.size()-offset)throw std::runtime_error("数据数组超长");
                         std::memcpy(values.data()+offset,packet.body.data.data()+r.at,bytes);current->crc=crc32(current->crc,packet.body.data.data()+r.at,bytes);current->offset+=bytes/4;
                         if(current->offset==values.size()){++current->next_field;current->offset=0;if(current->next_field==1&&!current->job.minute)++current->next_field;}
                     }else if(packet.command==Command::DataEnd){
-                        const auto checksum=r.u32();const auto elapsed=r.real();r.end();if(current->next_field!=8||checksum!=current->crc||!std::isfinite(elapsed)||elapsed<0)throw std::runtime_error("完整数据长度、CRC32或计时不符");
+                        const auto checksum=r.u32();const auto elapsed=r.real();r.end();if(current->next_field!=array_count(current->job)||checksum!=current->crc||!std::isfinite(elapsed)||elapsed<0)throw std::runtime_error("完整数据长度、CRC32或计时不符");
                         current->job.frontend_elapsed_ms=elapsed;current->job.started=ExportClock::now();
                         current->ready=true;data.send(reply(packet,Result::Ready),stop_data.value,parent.value);current.reset();
                     }else throw std::runtime_error("未知数据管道命令");

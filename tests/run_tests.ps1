@@ -1,4 +1,4 @@
-param([switch]$BuildDll, [string]$OutputRoot = [IO.Path]::GetTempPath())
+param([switch]$BuildDll, [string]$OutputRoot = [IO.Path]::GetTempPath(), [switch]$BenchmarkPairs, [switch]$CheckOnly, [switch]$NoReleaseCopy)
 $ErrorActionPreference = 'Stop'
 $projectDir = Split-Path -Parent $PSScriptRoot
 $OutputRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputRoot)
@@ -20,6 +20,34 @@ $asyncSource = Join-Path $projectDir 'SaveAsCSV\export\async_writer.cpp'
 Write-Host "测试输出与样例：$runDir"
 Push-Location -LiteralPath $runDir
 try {
+    if ($BenchmarkPairs) {
+        # 隔离构建两套相同优化参数的 DLL/后台；不覆盖 Release，也不读取通达信配置。
+        $ipcSource = Join-Path $projectDir 'shared\ipc.cpp'
+        $storeSource = Join-Path $projectDir 'shared\csv_store.cpp'
+        $processSource = Join-Path $projectDir 'SaveAsCSV\export\process_writer.cpp'
+        $iniSource = Join-Path $projectDir 'SaveAsCSV\utils\ini_reader.cpp'
+        $loggerSource = Join-Path $projectDir 'SaveAsCSV\utils\logger.cpp'
+        foreach ($variant in @('baseline', 'paired')) {
+            $variantDir = Join-Path $runDir $variant
+            New-Item -ItemType Directory -Path $variantDir | Out-Null
+            $defines = @('/DWIN32', '/DNDEBUG', '/DNOMINMAX')
+            if ($variant -eq 'baseline') { $defines += '/DTDX_LEGACY_API_BENCHMARK' }
+            Push-Location -LiteralPath $variantDir
+            try {
+                & $compiler /nologo /std:c++17 /EHsc /utf-8 /MT /O2 /W4 @defines (Join-Path $projectDir 'SaveAsCSVWorker\main.cpp') $ipcSource $storeSource $asyncSource $iniSource $loggerSource '/Fe:SaveAsCSVWorker.exe' /link /SUBSYSTEM:WINDOWS /LARGEADDRESSAWARE /DEBUG:NONE /INCREMENTAL:NO advapi32.lib shell32.lib
+                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                & $compiler /nologo /std:c++17 /EHsc /utf-8 /MT /O2 /LD /W4 @defines $storeSource $ipcSource $processSource (Join-Path $projectDir 'SaveAsCSV\dllmain.cpp') (Join-Path $projectDir 'SaveAsCSV\link\tdx\linkTDX.cpp') $iniSource $loggerSource '/Fe:SaveAsCSV.dll' /link /DEBUG:NONE /INCREMENTAL:NO advapi32.lib '/IMPLIB:SaveAsCSV.lib'
+                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            finally { Pop-Location }
+        }
+        $benchmarkExe = Join-Path $runDir 'paired_api_benchmark.exe'
+        & $compiler /nologo /std:c++17 /EHsc /utf-8 /MT /O2 /W4 /DWIN32 /DNOMINMAX (Join-Path $PSScriptRoot 'paired_api_benchmark.cpp') "/Fe:$benchmarkExe" /link /DEBUG:NONE /INCREMENTAL:NO
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $mode = if ($CheckOnly) { 'check' } else { 'benchmark' }
+        & $benchmarkExe (Join-Path $runDir 'baseline\SaveAsCSV.dll') (Join-Path $runDir 'paired\SaveAsCSV.dll') $runDir $mode
+        exit $LASTEXITCODE
+    }
     $testExe = Join-Path $runDir 'export_tests.exe'
     & $compiler /nologo /std:c++17 /EHsc /utf-8 /MD /W4 /DWIN32 /DNOMINMAX (Join-Path $PSScriptRoot 'export_tests.cpp') $asyncSource (Join-Path $projectDir 'SaveAsCSV\utils\ini_reader.cpp') "/Fe:$testExe" /link /DEBUG:NONE /INCREMENTAL:NO
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -70,6 +98,7 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     & $exitExe $dllPath $testWorkerPath (Join-Path $runDir 'host-exit')
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($NoReleaseCopy) { Write-Host "完整回归已通过，隔离产物保留在：$runDir"; exit 0 }
     $releaseDll = Join-Path $projectDir 'Release\SaveAsCSV.dll'
     New-Item -ItemType Directory -Path (Split-Path -Parent $releaseDll) -Force | Out-Null
     Copy-Item -LiteralPath $dllPath -Destination $releaseDll

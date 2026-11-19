@@ -5,7 +5,12 @@
 #include <utility>
 namespace tdx_export::ipc
 {
-constexpr std::uint32_t magic=0x31584353, version=1;
+constexpr std::uint32_t magic=0x31584353;
+#ifndef TDX_LEGACY_API_BENCHMARK
+constexpr std::uint32_t version=4; // 正式版传原始SPLIT，后台乘100；不能混用旧后台。
+#else
+constexpr std::uint32_t version=3;
+#endif
 constexpr std::size_t control_limit=4096, data_limit=65536;
 enum class Command:std::uint32_t {Hello=1,Start,Reserve,Release,Commit,Receipt,Query,Cancel,Drain,FinalAck,Data,DataEnd,TaskStatus,Begin};
 enum class Result:std::uint32_t {Ok,Wait,Rejected,Ready,Accepted,Done};
@@ -48,6 +53,7 @@ WriterStatus decode_status(Reader &r);
 void encode_job(Buffer &b,const ExportJob &job);
 ExportJob decode_job(Reader &r);
 std::vector<float> &array(ExportJob &job,unsigned field);
+inline unsigned array_count(const ExportJob &job) noexcept {return job.has_events?10:8;}
 std::wstring wide(const std::string &text);
 std::string narrow(const std::wstring &text);
 std::wstring relative_executable(const std::wstring &directory,const std::string &relative);
