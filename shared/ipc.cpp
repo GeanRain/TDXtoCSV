@@ -61,7 +61,8 @@ std::uint64_t creation_time(HANDLE process)
 std::vector<float> &array(ExportJob &j,unsigned field)
 {
     if(field==0)return j.dates;if(field==1)return j.times;
-    if(field<8)return j.series[field-2];if(field<10)return j.events[field-8];throw std::runtime_error("行情数组编号无效");
+    if(field<8)return j.series[field-2];if(field<10)return j.events[field-8];
+    if(field<12)return j.event_bars[field-10];throw std::runtime_error("行情数组编号无效");
 }
 std::wstring wide(const std::string &text)
 {

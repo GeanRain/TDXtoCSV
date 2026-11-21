@@ -98,6 +98,7 @@ void release_current() noexcept
     std::vector<float>().swap(s.times);
     for (auto &values : s.series) std::vector<float>().swap(values);
     for (auto &values : s.events) std::vector<float>().swap(values);
+    for (auto &values : s.event_bars) std::vector<float>().swap(values);
     if (s.reservation && export_writer) export_writer->release(s.reservation);
     s.reservation = 0;
 }
@@ -335,7 +336,11 @@ void Func4(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
 #else
         writer().start(config.limits, s.csv_dir, s.worker_path);
 #endif
+#ifndef TDX_LEGACY_API_BENCHMARK
+        s.reservation = writer().reserve(tdx_export::job_memory(s) + static_cast<std::uint64_t>(nCount) * (period <= 4 ? 32 : 48));
+#else
         s.reservation = writer().reserve(tdx_export::job_memory(s) + static_cast<std::uint64_t>(nCount) * (period <= 4 ? 32 : 40));
+#endif
         // 完整接收前先分配数组，后续 assign/resize 不再重复申请整份空间。
         writer().check_memory(static_cast<std::uint64_t>(nCount) * sizeof(float));
         s.dates.reserve(nCount);
@@ -351,6 +356,13 @@ void Func4(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
             writer().check_memory(static_cast<std::uint64_t>(nCount) * sizeof(float));
             values.reserve(nCount);
         }
+#ifndef TDX_LEGACY_API_BENCHMARK
+        if (period > 4) for (auto &values : s.event_bars)
+        {
+            writer().check_memory(static_cast<std::uint64_t>(nCount) * sizeof(float));
+            values.reserve(nCount);
+        }
+#endif
         s.active = true;
         return 1.0f;
     }, 0);
@@ -393,31 +405,31 @@ void Func2(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
     }, 2);
 }
 
-// 3：1开收、2高低、3量额、可选7原始SPLIT；成对复制，不读取前项结果或回填pOut。
+// 3：1开收、2高低、3量额；可选4除权、5除息均传计数及原值，不回填pOut。
 void Func3(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
 {
 #ifndef TDX_LEGACY_API_BENCHMARK
     (void)pOut;
     int type = 0;
     if (nCount > 0 && nCount <= kMaxCount && pIn1)
-        integer(pIn1[0], 1, 7, type);
+        integer(pIn1[0], 1, 5, type);
     execute(nCount, nullptr, [&]() -> float
     {
         if (!check_export(nCount, nullptr, false)) return -1.0f;
         auto &s = state();
-        if ((type != 1 && type != 2 && type != 3 && type != 7) ||
-            s.stage != (type == 7 ? 8 : type * 2) ||
-            ((type != 7 || !s.minute) && (!pIn2 || !pIn3)))
-            return reject("成对数组缺失，或未按 1开收、2高低、3量额、可选7事件的顺序传入");
-        if (type == 7)
+        if (type == 0 || s.stage != (type <= 3 ? type * 2 : type + 4) ||
+            ((type <= 3 || !s.minute) && (!pIn2 || !pIn3)))
+            return reject("成对数组缺失，或未按1开收、2高低、3量额、可选4除权及5除息的顺序传入");
+        if (type >= 4)
         {
             if (!s.minute)
             {
-                s.events[0].assign(pIn2, pIn2 + nCount);
-                s.events[1].assign(pIn3, pIn3 + nCount);
-                s.has_events = true;
+                const int event = type - 4;
+                s.event_bars[event].assign(pIn2, pIn2 + nCount);
+                s.events[event].assign(pIn3, pIn3 + nCount);
+                if (type == 5) s.has_events = true;
             }
-            s.stage = 9;
+            ++s.stage;
         }
         else
         {
@@ -427,7 +439,7 @@ void Func3(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
             s.stage += 2;
         }
         return 1.0f;
-    }, type == 7 ? 10 : type >= 1 && type <= 3 ? type * 2 + 1 : -1);
+    }, type >= 4 ? 10 : type >= 1 ? type * 2 + 1 : -1);
 #else
     // 仅供隔离基准构建合并前版本，正式解决方案不启用。
     int type = 0;
@@ -472,7 +484,11 @@ void Func1(int nCount, float *pOut, float *pIn1, float *pIn2, float *pIn3)
         if (!pIn1 || !integer(pIn1[0], 3, 3, command))
             return reject("请更新公式：使用 4 号开始、5 号确认，并依次传递上一步结果", false);
         if (!check_export(nCount, pIn2)) return -1.0f;
+#ifndef TDX_LEGACY_API_BENCHMARK
+        if (s.stage != 8 && s.stage != 10) return reject("本次行情或除权除息数据未完整接收");
+#else
         if (s.stage != 8 && s.stage != 9) return reject("本次数据未完整接收");
+#endif
         symbol = s.symbol;
         period = s.period;
         id = s.reservation;

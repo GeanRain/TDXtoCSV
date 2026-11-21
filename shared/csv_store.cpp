@@ -415,6 +415,11 @@ bool write_csv(ExportJob &s)
     for (const auto &values : s.events)
         if (s.has_events ? values.size() != static_cast<size_t>(s.count) : !values.empty())
             return save_reject("后台除权除息数组缺失或长度不一致");
+#ifndef TDX_LEGACY_API_BENCHMARK
+    for (const auto &values : s.event_bars)
+        if (s.has_events ? values.size() != static_cast<size_t>(s.count) : !values.empty())
+            return save_reject("后台除权除息周期数组缺失或长度不一致");
+#endif
     std::vector<float> event_results[2];
     if (s.has_events && !s.minute)
         for (auto &values : event_results) values.resize(s.count, 0.0f);
@@ -447,11 +452,12 @@ bool write_csv(ExportJob &s)
         row.has_events = s.has_events && !s.minute;
         if (row.has_events) for (int v = 0; v < 2; ++v)
         {
-            // 原始数组保持不变，重试时仍与原始前值比较；首项和未变化位置保留零。
-            if (i > 0 && s.events[v][i] != s.events[v][i - 1])
 #ifndef TDX_LEGACY_API_BENCHMARK
-                event_results[v][i] = s.events[v][i] * 100.0f;
+            // 只按事件标记判断，首项同样有效；原始计数和值不修改，便于重试。
+            if (s.event_bars[v][i] == 0)
+                event_results[v][i] = v == 0 ? s.events[v][i] : s.events[v][i] * 10.0f;
 #else
+            if (i > 0 && s.events[v][i] != s.events[v][i - 1])
                 event_results[v][i] = s.events[v][i];
 #endif
             row.events[v] = event_results[v][i];

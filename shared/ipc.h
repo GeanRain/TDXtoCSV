@@ -7,7 +7,7 @@ namespace tdx_export::ipc
 {
 constexpr std::uint32_t magic=0x31584353;
 #ifndef TDX_LEGACY_API_BENCHMARK
-constexpr std::uint32_t version=4; // 正式版传原始SPLIT，后台乘100；不能混用旧后台。
+constexpr std::uint32_t version=5; // 两组事件各传SPLITBARS及SPLIT，不能混用旧后台。
 #else
 constexpr std::uint32_t version=3;
 #endif
@@ -53,7 +53,13 @@ WriterStatus decode_status(Reader &r);
 void encode_job(Buffer &b,const ExportJob &job);
 ExportJob decode_job(Reader &r);
 std::vector<float> &array(ExportJob &job,unsigned field);
-inline unsigned array_count(const ExportJob &job) noexcept {return job.has_events?10:8;}
+inline unsigned array_count(const ExportJob &job) noexcept {
+#ifndef TDX_LEGACY_API_BENCHMARK
+    return job.has_events?12:8;
+#else
+    return job.has_events?10:8;
+#endif
+}
 std::wstring wide(const std::string &text);
 std::string narrow(const std::wstring &text);
 std::wstring relative_executable(const std::wstring &directory,const std::string &relative);

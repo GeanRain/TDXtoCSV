@@ -111,13 +111,13 @@ int main(int argc,char **argv){
         check(s.accepted==3&&s.succeeded==3&&!s.failed&&!s.bytes&&!s.unfinished,"跳过写盘仍须计为成功并释放全部额度");
         check(read(file)==original&&fs::last_write_time(file)==modified,"重复导出不得修改CSV");check(f.logs().find("数据未变化，跳过写盘：")!=std::string::npos,"真实后台缺少跳过写盘日志");
     });
-    run("真实后台事件双数组保存及重复导出释放额度",[&]{
-        Fixture f(production,root/"events");f.start();auto item=job(f,7);item.has_events=true;item.events[0]={10,20,20,30,30,60,66};item.events[1]={7,8,8,8,9,9,9};
+    run("真实后台事件计数和值保存及重复导出释放额度",[&]{
+        Fixture f(production,root/"events");f.start();auto item=job(f,7);item.has_events=true;item.events[0]={10,20,20,30,30,60,66};item.events[1]={7,8,8,8,9,9,9};item.event_bars[0]={0,0,1,0,1,0,0};item.event_bars[1]={1,0,1,1,0,1,0};
         auto copy=item;submit(f,std::move(copy));wait_until([&]{return f.writer->status().unfinished==0;},"首次事件保存未完成");
         const auto file=f.dir/"csv"/"600000.SH.1d.csv";const auto original=read(file);const auto modified=fs::last_write_time(file);
-        std::string expected="symbol,period,ts,open,high,low,close,volume,amount,ExRights,ExDividend\n";const char *rights[]={"0","2000","0","3000","0","6000","6600"},*dividend[]={"0","800","0","0","900","0","0"};
+        std::string expected="symbol,period,ts,open,high,low,close,volume,amount,ExRights,ExDividend\n";const char *rights[]={"10","20","0","30","0","60","66"},*dividend[]={"0","80","0","0","90","0","90"};
         for(int i=0;i<7;++i)expected+="600000.SH,1d,2020-01-0"+std::to_string(i+1)+" 15:00:00,10,12,9,11,100,1000,"+rights[i]+","+dividend[i]+"\n";
-        check(original==expected,"原始双数组跨进程后应独立提取变化值，并保留全部零值日期行");
+        check(original==expected,"计数和值跨进程后按零计数保存，包含首项、同值重复事件及全部日期行");
         Handle hold(CreateFileW(file.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr));check(bool(hold),"无法禁止替换事件CSV");
         submit(f,std::move(item));check(f.finish(),"相同事件重导应成功");const auto s=f.writer->status();check(s.succeeded==2&&!s.failed&&!s.bytes&&!s.unfinished,"事件任务完成后必须释放额度");
         check(read(file)==original&&fs::last_write_time(file)==modified,"重复事件不得重写文件");
@@ -168,12 +168,12 @@ int main(int argc,char **argv){
         hash={};hash.u32(crc^1);check(raw.state(raw.call(Command::Commit,id,hash))==Result::Rejected,"不同摘要未拒绝");check(raw.status().accepted==1,"重复入队");raw.close();
         f.writer=std::make_unique<ProcessWriter>(narrow(f.dir.wstring()));check(f.finish(),"重复提交后排空失败");check(f.writer->status().succeeded==1,"重复保存");
     });
-    for(int fault=0;fault<6;++fault)run(("残片和非法数据不入队 case="+std::to_string(fault)).c_str(),[&]{
-        Fixture f(production,root/("packet-"+std::to_string(fault)));f.start();RawClient raw(f);auto j=job(f);if(fault>=4){j.has_events=true;j.events[0]={50,0};j.events[1]={0,25};}const auto id=raw.begin(j);
+    for(int fault=0;fault<8;++fault)run(("残片和非法数据不入队 case="+std::to_string(fault)).c_str(),[&]{
+        Fixture f(production,root/("packet-"+std::to_string(fault)));f.start();RawClient raw(f);auto j=job(f);if(fault>=4){j.has_events=true;j.events[0]={.5f,0};j.events[1]={0,.25f};j.event_bars[0]={0,1};j.event_bars[1]={1,0};}const auto id=raw.begin(j);
         if(fault==0){raw.data.close();} // 元数据已收到，数组还没有发完就断线。
         else if(fault==1){raw.arrays(id,j);raw.data.close();} // 数组完整，尚未DATA_END/COMMIT。
         else if(fault==2||fault==5){const auto crc=raw.arrays(id,j);bool denied=false;try{raw.end(id,crc^1);}catch(...){denied=true;}check(denied,"错误CRC被接受");}
-        else if(fault==4){j.events[1].clear();const auto crc=raw.arrays(id,j);bool denied=false;try{raw.end(id,crc);}catch(...){denied=true;}check(denied,"缺少第二组事件数组被接受");}
+        else if(fault==4||fault>=6){if(fault==4)j.events[1].clear();else j.event_bars[fault-6].clear();bool denied=false;try{const auto crc=raw.arrays(id,j);raw.end(id,crc);}catch(...){denied=true;}check(denied,"缺少事件值或计数数组被接受");}
         else{Packet p;p.command=Command::Data;p.epoch=raw.epoch;p.id=id;p.body.u32(0);p.body.u32(1);p.body.u32(0);raw.data.send(p);bool denied=false;try{raw.data.receive();}catch(...){denied=true;}check(denied,"数组偏移乱序被接受");}
         check(raw.status().accepted==0,"残片被计为完整任务");check(!fs::exists(f.dir/"csv"/"600000.SH.1d.csv"),"残片写入CSV");raw.call(Command::Release,id);raw.close();f.writer=std::make_unique<ProcessWriter>(narrow(f.dir.wstring()));check(f.finish(),"清理残片不能干净退出");check(!f.writer->status().reserved,"残片额度泄漏");
     });

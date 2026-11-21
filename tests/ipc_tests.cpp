@@ -27,10 +27,11 @@ int main(){
         }
         tdx_export::ExportJob job{2,5,150000,false,"600000.SH","1d","D:\\csv"};job.has_events=true;job.call_ms[10]=1.25;
         Buffer metadata;encode_job(metadata,job);Reader encoded(metadata.data);const auto restored=decode_job(encoded);encoded.end();
-        check(restored.has_events&&array_count(restored)==10&&restored.call_ms[10]==1.25,"事件标识及新增接口计时跨进程不丢失");
+        check(version==5&&restored.has_events&&array_count(restored)==12&&restored.call_ms[10]==1.25,"事件计数和值使用新版协议且计时跨进程不丢失");
         check(&array(job,8)==&job.events[0] && &array(job,9)==&job.events[1],"两个事件数组使用独立传输编号");
-        const auto base=tdx_export::job_memory(job);job.events[0].reserve(100);job.events[1].reserve(200);
-        check(tdx_export::job_memory(job)==base+(job.events[0].capacity()+job.events[1].capacity())*sizeof(float),"事件双数组计入队列内存额度");
+        check(&array(job,10)==&job.event_bars[0] && &array(job,11)==&job.event_bars[1],"两个事件计数数组使用独立传输编号");
+        const auto base=tdx_export::job_memory(job);job.events[0].reserve(100);job.events[1].reserve(200);job.event_bars[0].reserve(300);job.event_bars[1].reserve(400);
+        check(tdx_export::job_memory(job)==base+(job.events[0].capacity()+job.events[1].capacity()+job.event_bars[0].capacity()+job.event_bars[1].capacity())*sizeof(float),"事件计数和值四数组计入队列内存额度");
         metadata.data.back()=2;denied=false;try{Reader invalid(metadata.data);decode_job(invalid);}catch(const std::exception &){denied=true;}check(denied,"拒绝非法事件标识");
         job.has_events=false;metadata={};encode_job(metadata,job);Reader legacy(metadata.data);check(!decode_job(legacy).has_events&&array_count(job)==8,"旧六字段公式只传原有数组");
     }catch(const std::exception &e){std::cout<<"异常："<<e.what()<<'\n';++failed;}
